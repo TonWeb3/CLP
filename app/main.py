@@ -39,13 +39,9 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="ClipForge", lifespan=lifespan)
 
-LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", "testserver"}
-
 
 @app.middleware("http")
 async def guard(request: Request, call_next):
-    host = (request.headers.get("host") or "").rsplit(":", 1)[0] if not (request.headers.get("host") or "").startswith("[") \
-        else (request.headers.get("host") or "").split("]")[0] + "]"
     if request.method not in ("GET", "HEAD", "OPTIONS"):
         origin = request.headers.get("origin")
         if origin and urlparse(origin).netloc != request.headers.get("host"):
@@ -61,10 +57,6 @@ async def guard(request: Request, call_next):
                 ok = False
         if not ok:
             return Response("Password required", status_code=401, headers={"WWW-Authenticate": 'Basic realm="ClipForge"'})
-    elif host not in LOCAL_HOSTS:
-        return JSONResponse(
-            {"detail": "Remote access is disabled. Start ClipForge with CLIPFORGE_PASSWORD set, or open it "
-                       "through an SSH tunnel (ssh -L 8000:localhost:8000 you@server)."}, status_code=403)
     return await call_next(request)
 
 
