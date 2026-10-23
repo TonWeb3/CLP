@@ -14,6 +14,8 @@ class LLMError(RuntimeError):
 
 def parse_json(text: str):
     text = (text or "").strip()
+    # Strip <think>...</think> reasoning blocks from modern thinking models
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.I).strip()
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I)
     try:
         return json.loads(text)
@@ -122,3 +124,61 @@ def test_connection(cfg: dict) -> dict:
         return {"ok": False, "message": "Cannot reach the server. Check the address and that it is running."}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "message": str(e)[:300]}
+
+
+SOCIAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tiktok": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "caption": {"type": "string"},
+                "hashtags": {"type": "array", "items": {"type": "string"}},
+                "first_comment": {"type": "string"},
+            },
+            "required": ["title", "caption", "hashtags", "first_comment"],
+        },
+        "youtube": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "pinned_comment": {"type": "string"},
+            },
+            "required": ["title", "description", "tags", "pinned_comment"],
+        },
+        "virality_score": {
+            "type": "object",
+            "properties": {
+                "overall": {"type": "number"},
+                "hook_rating": {"type": "string"},
+                "key_takeaway": {"type": "string"},
+            },
+            "required": ["overall", "hook_rating", "key_takeaway"],
+        },
+    },
+    "required": ["tiktok", "youtube", "virality_score"],
+}
+
+
+def generate_social_post(cfg: dict, clip_title: str, hook: str, transcript_snippet: str) -> dict:
+    model = cfg.get("ranker_model") or cfg.get("filter_model")
+    if not model:
+        raise LLMError("No model selected in Settings. Choose a model first.")
+
+    system = (
+        "You are a world-class viral short-form social media strategist specializing in TikTok and YouTube Shorts algorithms.\n"
+        "Generate platform-specific, high-CTR, high-engagement copy for the provided video clip.\n\n"
+        "Guidelines:\n"
+        "1. TikTok: punchy curiosity title (<60 chars), engaging 1-2 sentence caption that invites discussion, 5-8 trending niche hashtags, and a polarizing or conversational first comment.\n"
+        "2. YouTube Shorts: click-worthy title (<90 chars with #Shorts), informative SEO description with keywords, relevant tags, and a pinned comment prompt.\n"
+        "3. Virality Score: score 1-10 with hook evaluation and takeaway."
+    )
+    user = (
+        f"Clip Title: {clip_title}\n"
+        f"Hook / Opening Line: {hook}\n"
+        f"Transcript:\n{transcript_snippet}\n"
+    )
+    return chat_json(cfg, model, system, user, SOCIAL_SCHEMA)

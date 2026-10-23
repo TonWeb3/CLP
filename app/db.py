@@ -28,9 +28,25 @@ CREATE TABLE IF NOT EXISTS clips(
   path TEXT, thumb_path TEXT, width INTEGER, height INTEGER, size INTEGER,
   render_opts TEXT,
   yt_status TEXT, yt_progress REAL DEFAULT 0, yt_id TEXT, yt_error TEXT,
+  tiktok_status TEXT, tiktok_progress REAL DEFAULT 0, tiktok_id TEXT, tiktok_error TEXT,
+  social_copy TEXT,
   created REAL, updated REAL
 );
 CREATE INDEX IF NOT EXISTS idx_clips_video ON clips(video_id);
+
+CREATE TABLE IF NOT EXISTS scheduled_uploads(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  clip_id INTEGER,
+  platforms TEXT,
+  scheduled_time REAL,
+  status TEXT DEFAULT 'pending',
+  options TEXT,
+  results TEXT,
+  error TEXT,
+  created REAL,
+  updated REAL
+);
+CREATE INDEX IF NOT EXISTS idx_sched_status_time ON scheduled_uploads(status, scheduled_time);
 """
 
 
@@ -40,9 +56,24 @@ def init() -> None:
     with _lock:
         if _conn is not None:
             _conn.close()
-        _conn = sqlite3.connect(str(config.DATA_DIR / "clipforge.db"), check_same_thread=False)
+        _conn = sqlite3.connect(str(config.DATA_DIR / "clipforge.db"), check_same_thread=False, timeout=30.0)
         _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA journal_mode=WAL;")
+        _conn.execute("PRAGMA synchronous=NORMAL;")
         _conn.executescript(SCHEMA)
+
+        # Migrations for existing databases
+        clip_cols = {r["name"] for r in _conn.execute("PRAGMA table_info(clips)").fetchall()}
+        for col, ctype in [
+            ("tiktok_status", "TEXT"),
+            ("tiktok_progress", "REAL DEFAULT 0"),
+            ("tiktok_id", "TEXT"),
+            ("tiktok_error", "TEXT"),
+            ("social_copy", "TEXT"),
+        ]:
+            if col not in clip_cols:
+                _conn.execute(f"ALTER TABLE clips ADD COLUMN {col} {ctype};")
+
         _conn.commit()
 
 

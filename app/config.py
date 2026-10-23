@@ -36,8 +36,15 @@ DEFAULTS: dict = {
     "energy_weight": 0.15,
     # --- Rendering -------------------------------------------------------
     "aspect": "9:16",  # 9:16 | 1:1 | 4:5 | 16:9
-    "reframe": "face",  # face | center | blur
+    "reframe": "face",  # face | split | center | blur
     "captions": True,
+    "caption_preset": "classic",  # classic | hormozi | mrbeast | minimalist
+    "caption_emojis": True,
+    "headline_banner": True,
+    "normalize_audio": True,
+    "clean_audio": True,
+    "dynamic_zoom": True,
+    "remove_silence": False,
     "caption_font": "Arial",
     "caption_size": 84,
     "caption_color": "#FFFFFF",
@@ -59,9 +66,13 @@ DEFAULTS: dict = {
     "yt_client_secret": "",
     "yt_privacy": "private",
     "yt_add_shorts_tag": True,
+    # --- TikTok upload ---------------------------------------------------
+    "tiktok_client_key": "",
+    "tiktok_client_secret": "",
+    "tiktok_privacy": "PUBLIC_TO_EVERYONE",  # PUBLIC_TO_EVERYONE | MUTUAL_FOLLOW_FRIENDS | SELF_ONLY
 }
 
-SECRET_KEYS = {"llm_api_key", "cookies", "yt_client_secret"}
+SECRET_KEYS = {"llm_api_key", "cookies", "yt_client_secret", "tiktok_client_secret"}
 
 _lock = threading.RLock()
 _cache: dict | None = None

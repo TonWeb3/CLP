@@ -100,6 +100,7 @@ async function route() {
   let page;
   if (path.startsWith("/video/")) page = VideoPage(parseInt(path.split("/")[2], 10));
   else if (path === "/library") page = LibraryPage();
+  else if (path === "/publisher") page = PublisherPage();
   else if (path === "/models") page = ModelsPage();
   else if (path === "/settings") page = SettingsPage(params);
   else page = HomePage();
@@ -352,12 +353,33 @@ function VideoPage(id) {
 
     const sels = () => data.clips.filter((c) => c.selected);
     const aspect = h("select", { "aria-label": "Shape" }, [["9:16", "Vertical 9:16"], ["1:1", "Square 1:1"], ["4:5", "Portrait 4:5"], ["16:9", "Wide 16:9"]].map(([v2, t]) => h("option", { value: v2, selected: v2 === (defaults.aspect || "9:16") }, t)));
-    const reframe = h("select", { "aria-label": "Framing" }, [["face", "Follow the speaker"], ["center", "Center crop"], ["blur", "Fit with blurred background"]].map(([v2, t]) => h("option", { value: v2, selected: v2 === (defaults.reframe || "face") }, t)));
+    const reframe = h("select", { "aria-label": "Framing" }, [["face", "Follow speaker"], ["split", "Split-screen (2 speakers)"], ["center", "Center crop"], ["blur", "Fit with blurred background"]].map(([v2, t]) => h("option", { value: v2, selected: v2 === (defaults.reframe || "face") }, t)));
+    const preset = h("select", { "aria-label": "Caption style" }, [["classic", "Classic Subtitles"], ["hormozi", "Hormozi (Bold Neon)"], ["mrbeast", "MrBeast (Punchy)"], ["minimalist", "Minimalist Clean"]].map(([v2, t]) => h("option", { value: v2, selected: v2 === (defaults.caption_preset || "classic") }, t)));
     const caps = h("input", { type: "checkbox", checked: defaults.captions !== false, id: "caps" });
+    const headline = h("input", { type: "checkbox", checked: defaults.headline_banner !== false, id: "headline" });
+    const emojis = h("input", { type: "checkbox", checked: defaults.caption_emojis !== false, id: "emojis" });
+    const zoom = h("input", { type: "checkbox", checked: defaults.dynamic_zoom !== false, id: "zoom" });
+    const clean = h("input", { type: "checkbox", checked: defaults.clean_audio !== false, id: "clean" });
+    const silence = h("input", { type: "checkbox", checked: !!defaults.remove_silence, id: "silence" });
+
     const renderBtn = h("button", { class: "btn primary", onclick: guard(async () => {
       const ids = sels().map((c) => c.id);
       if (!ids.length) return;
-      const r = await api(`/videos/${id}/render`, { method: "POST", json: { clip_ids: ids, aspect: aspect.value, reframe: reframe.value, captions: caps.checked } });
+      const r = await api(`/videos/${id}/render`, {
+        method: "POST",
+        json: {
+          clip_ids: ids,
+          aspect: aspect.value,
+          reframe: reframe.value,
+          captions: caps.checked,
+          caption_preset: preset.value,
+          caption_emojis: emojis.checked,
+          headline: headline.checked,
+          clean_audio: clean.checked,
+          dynamic_zoom: zoom.checked,
+          remove_silence: silence.checked,
+        }
+      });
       toast(r.queued ? `${r.queued} clip${r.queued > 1 ? "s" : ""} queued for rendering.` : "Those clips are already rendering.");
       load();
     }) }, "Render");
@@ -398,9 +420,17 @@ function VideoPage(id) {
               h("button", { class: "btn sm", onclick: () => setAll((c) => c.rank != null && c.rank <= 5) }, "Select top 5"),
               h("button", { class: "btn sm ghost", onclick: () => setAll(() => false) }, "Clear"))),
           list,
-          h("div", { class: "renderbar row between" },
-            h("div", { class: "row" }, aspect, reframe, h("label", { class: "row small", for: "caps" }, caps, "Captions")),
-            renderBtn))));
+          h("div", { class: "renderbar stack" },
+            h("div", { class: "row between" },
+              h("div", { class: "row" }, aspect, reframe, preset),
+              renderBtn),
+            h("div", { class: "row small muted", style: { gap: "16px" } },
+              h("label", { class: "row small", for: "caps" }, caps, "Captions"),
+              h("label", { class: "row small", for: "emojis", title: "Add auto-emojis to viral keywords" }, emojis, "Emojis"),
+              h("label", { class: "row small", for: "zoom", title: "Subtle retention zoom on opening hook" }, zoom, "Hook zoom"),
+              h("label", { class: "row small", for: "headline", title: "Show bold top headline banner" }, headline, "Top banner"),
+              h("label", { class: "row small", for: "clean", title: "Denoise and enhance voice clarity" }, clean, "Clean audio"),
+              h("label", { class: "row small", for: "silence", title: "Trim dead pauses over 0.8s" }, silence, "Trim silence"))))));
   }
 
   function updateReady() { for (const c of data.clips) { const f = cardRefs.get(c.id); if (f) f.update(c); } }
@@ -431,67 +461,127 @@ function LibraryPage() {
     grid);
   let sig = "", refs = new Map(), timer;
 
-  async function openUpload(c) {
-    let yt = { connected: false };
+  async function openUploadTikTok(c) {
+    let tt = { connected: false };
     let st = {};
-    try { yt = await api("/youtube/status"); st = (await api("/settings")).settings; } catch (e) { toast(e.message, true); return; }
-    if (!yt.connected) {
-      const close = modal(h("div", { class: "stack" }, h("h2", {}, "Connect YouTube first"),
-        h("p", { class: "muted" }, "Add your Google OAuth keys and sign in once in Settings. After that you can upload with one click."),
+    try { tt = await api("/tiktok/status"); st = (await api("/settings")).settings; } catch (e) { toast(e.message, true); return; }
+    if (!tt.connected) {
+      const close = modal(h("div", { class: "stack" }, h("h2", {}, "Connect TikTok first"),
+        h("p", { class: "muted" }, "Add your TikTok Client Key and Client Secret in Settings. After that you can post with one click."),
         h("div", { class: "row end" }, h("button", { class: "btn", onclick: () => close() }, "Close"), h("a", { class: "btn primary", href: "#/settings", onclick: () => close() }, "Open settings"))));
       return;
     }
-    const title = h("input", { type: "text", value: c.title, maxLength: 100 });
-    const desc = h("textarea", {}, c.hook ? c.hook : "");
-    const tags = h("input", { type: "text", placeholder: "podcast, interview, highlights" });
-    const priv = h("select", {}, ["private", "unlisted", "public"].map((p) => h("option", { value: p, selected: p === (st.yt_privacy || "private") }, p[0].toUpperCase() + p.slice(1))));
-    const shorts = h("input", { type: "checkbox", checked: st.yt_add_shorts_tag !== false });
+    const title = h("input", { type: "text", value: c.title, maxLength: 150 });
+    const priv = h("select", {}, [
+      ["PUBLIC_TO_EVERYONE", "Public to everyone"],
+      ["MUTUAL_FOLLOW_FRIENDS", "Friends only"],
+      ["SELF_ONLY", "Only me (Private)"]
+    ].map(([v, t]) => h("option", { value: v, selected: v === (st.tiktok_privacy || "PUBLIC_TO_EVERYONE") }, t)));
+
     const go = h("button", { class: "btn primary", onclick: guard(async () => {
       go.disabled = true;
       try {
-        await api(`/clips/${c.id}/youtube`, { method: "POST", json: { title: title.value, description: desc.value, tags: tags.value.split(",").map((t) => t.trim()).filter(Boolean), privacy: priv.value, add_shorts_tag: shorts.checked } });
-        close(); toast("Upload started."); load();
+        await api(`/clips/${c.id}/tiktok`, { method: "POST", json: { title: title.value, privacy: priv.value } });
+        close(); toast("TikTok upload started."); load();
       } finally { go.disabled = false; }
-    }) }, "Upload");
-    const close = modal(h("div", { class: "stack" }, h("h2", {}, "Upload to YouTube"),
-      h("label", { class: "field" }, h("span", { class: "lbl" }, "Title"), title),
-      h("label", { class: "field" }, h("span", { class: "lbl" }, "Description"), desc),
-      h("label", { class: "field" }, h("span", { class: "lbl" }, "Tags (comma separated)"), tags),
-      h("label", { class: "field" }, h("span", { class: "lbl" }, "Visibility"), priv,
-        h("span", { class: "hint" }, "YouTube forces uploads from unverified Google projects to Private until the project passes Google's audit. See Settings.")),
-      h("label", { class: "check" }, shorts, h("span", {}, "Add #Shorts to vertical clips")),
+    }) }, "Upload to TikTok");
+
+    const close = modal(h("div", { class: "stack" }, h("h2", {}, "Upload to TikTok"),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Video Caption / Title"), title),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Who can watch this video"), priv),
       h("div", { class: "row end" }, h("button", { class: "btn", onclick: () => close() }, "Cancel"), go)));
+  }
+
+  async function openSocialCopy(c) {
+    const box = h("div", { class: "stack", style: { minHeight: "180px" } }, h("p", { class: "muted" }, "Generating AI viral social copy..."));
+    const close = modal(h("div", { class: "stack" }, h("h2", {}, "AI Viral Social Copy & Hashtags"), box,
+      h("div", { class: "row end", style: { marginTop: "12px" } }, h("button", { class: "btn", onclick: () => close() }, "Close"))));
+
+    try {
+      let copy = c.social_copy;
+      if (!copy) {
+        const res = await api(`/clips/${c.id}/social-copy`, { method: "POST" });
+        copy = res.social_copy;
+        c.social_copy = copy;
+      }
+      const copyBtn = (txt, label = "Copy") => h("button", { class: "btn sm", onclick: () => {
+        if (navigator.clipboard) { navigator.clipboard.writeText(txt); toast("Copied!"); }
+      } }, label);
+
+      const tt = copy.tiktok || {};
+      const yt = copy.youtube || {};
+      const vScore = copy.virality_score || {};
+
+      box.replaceChildren(
+        h("div", { class: "banner", style: { marginBottom: "10px" } },
+          h("div", { class: "row" },
+            chip(`Virality: ${vScore.overall || 8.5}/10`, "ok"),
+            vScore.hook_rating ? chip(vScore.hook_rating, "info") : null),
+          vScore.key_takeaway ? h("div", { class: "small", style: { marginTop: "6px" } }, vScore.key_takeaway) : null),
+        h("div", { class: "social-box" },
+          h("header", {}, h("span", {}, "TikTok Copy"), copyBtn(`${tt.title || ""}\n\n${tt.caption || ""}\n\n${(tt.hashtags || []).join(" ")}`, "Copy TikTok Post")),
+          h("div", { class: "small" }, h("strong", {}, "Title: "), tt.title || ""),
+          h("div", { class: "small", style: { margin: "4px 0" } }, h("strong", {}, "Caption: "), tt.caption || ""),
+          h("div", { class: "small muted" }, (tt.hashtags || []).join(" ")),
+          tt.first_comment ? h("div", { class: "small", style: { marginTop: "6px", fontStyle: "italic" } }, "💬 First comment: " + tt.first_comment) : null),
+        h("div", { class: "social-box" },
+          h("header", {}, h("span", {}, "YouTube Shorts Copy"), copyBtn(`${yt.title || ""}\n\n${yt.description || ""}\n\n${(yt.tags || []).join(", ")}`, "Copy Shorts Post")),
+          h("div", { class: "small" }, h("strong", {}, "Title: "), yt.title || ""),
+          h("div", { class: "small", style: { margin: "4px 0" } }, h("strong", {}, "Description: "), yt.description || ""),
+          h("div", { class: "small muted" }, (yt.tags || []).join(", ")),
+          yt.pinned_comment ? h("div", { class: "small", style: { marginTop: "6px", fontStyle: "italic" } }, "📌 Pinned comment: " + yt.pinned_comment) : null));
+    } catch (e) {
+      box.replaceChildren(h("div", { class: "small", style: { color: "var(--err)" } }, "Could not generate copy: " + (e.message || e)));
+    }
   }
 
   function card(c) {
     const wide = c.width > c.height;
     const ytBox = h("div", { class: "small" });
     const ytBar = bar(0);
-    const upBtn = h("button", { class: "btn sm", onclick: () => openUpload(c) }, "Upload to YouTube");
+    const ttBox = h("div", { class: "small" });
+    const ttBar = bar(0);
+
+    const upBtn = h("button", { class: "btn sm", onclick: () => openUpload(c) }, "YouTube");
+    const ttBtn = h("button", { class: "btn sm", onclick: () => openUploadTikTok(c) }, "TikTok");
+    const copyBtn = h("button", { class: "btn sm ghost", onclick: () => openSocialCopy(c) }, "Social copy");
+    const schedBtn = h("button", { class: "btn sm ghost", onclick: () => { location.hash = "#/publisher?clip=" + c.id; } }, "Schedule");
+
     function upd(nc) {
       Object.assign(c, nc);
       ytBox.replaceChildren();
-      if (c.yt_status === "uploading") { ytBox.append(chip("Uploading " + Math.round(c.yt_progress * 100) + "%", "info")); }
-      else if (c.yt_status === "done") ytBox.append(chip("Uploaded", "ok"), " ", h("a", { href: `https://youtu.be/${c.yt_id}`, target: "_blank", rel: "noopener" }, "Open on YouTube"));
-      else if (c.yt_status === "failed") ytBox.append(chip("Upload failed", "err"), h("div", { style: { color: "var(--err)", marginTop: "4px" } }, c.yt_error || ""));
+      if (c.yt_status === "uploading") ytBox.append(chip("YouTube: " + Math.round(c.yt_progress * 100) + "%", "info"));
+      else if (c.yt_status === "done") ytBox.append(chip("YouTube", "ok"), " ", h("a", { href: `https://youtu.be/${c.yt_id}`, target: "_blank", rel: "noopener" }, "Watch"));
+      else if (c.yt_status === "failed") ytBox.append(chip("YouTube failed", "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, c.yt_error || ""));
       ytBar.style.display = c.yt_status === "uploading" ? "" : "none";
       setBar(ytBar, (c.yt_progress || 0) * 100);
+
+      ttBox.replaceChildren();
+      if (c.tiktok_status === "uploading") ttBox.append(chip("TikTok: " + Math.round(c.tiktok_progress * 100) + "%", "info"));
+      else if (c.tiktok_status === "done") ttBox.append(chip("TikTok", "ok"), " Published");
+      else if (c.tiktok_status === "failed") ttBox.append(chip("TikTok failed", "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, c.tiktok_error || ""));
+      ttBar.style.display = c.tiktok_status === "uploading" ? "" : "none";
+      setBar(ttBar, (c.tiktok_progress || 0) * 100);
+
       upBtn.disabled = c.yt_status === "uploading";
-      upBtn.textContent = c.yt_status === "done" ? "Upload again" : "Upload to YouTube";
+      ttBtn.disabled = c.tiktok_status === "uploading";
     }
+
     const del = h("button", { class: "btn sm danger ghost", onclick: guard(async () => {
       if (!confirm("Delete this clip file from the server?")) return;
       await api(`/clips/${c.id}`, { method: "DELETE" }); load();
     }) }, "Delete");
+
     const el = h("div", { class: "clip" },
       h("video", { class: wide ? "wide" : "", controls: true, preload: "metadata", poster: c.has_thumb ? `/api/clips/${c.id}/thumb` : null, src: `/api/clips/${c.id}/file` }),
       h("div", { class: "body" },
         h("div", { class: "ttl" }, c.title),
         h("div", { class: "small muted" }, `${Math.round(c.end - c.start)}s · ${c.width}×${c.height} · ${fmtBytes(c.size)}`),
         h("div", { class: "small muted", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, title: c.video_title }, "From: " + (c.video_title || "")),
-        ytBox, ytBar,
+        ytBox, ytBar, ttBox, ttBar,
         h("div", { class: "actions" },
-          h("a", { class: "btn sm", href: `/api/clips/${c.id}/file?download=1`, download: "" }, "Download"), upBtn, del)));
+          h("a", { class: "btn sm", href: `/api/clips/${c.id}/file?download=1`, download: "" }, "Download"),
+          copyBtn, upBtn, ttBtn, schedBtn, del)));
     upd(c);
     refs.set(c.id, upd);
     return el;
@@ -501,7 +591,7 @@ function LibraryPage() {
     let r;
     try { r = await api("/clips?status=ready"); } catch { return; }
     folder.textContent = r.folder;
-    const s = r.clips.map((c) => c.id + ":" + (c.yt_status === "uploading" ? "up" : c.yt_status || "")).join("|");
+    const s = r.clips.map((c) => `${c.id}:${c.yt_status || ""}:${c.tiktok_status || ""}`).join("|");
     if (s !== sig) {
       sig = s; refs = new Map();
       grid.replaceChildren(...(r.clips.length ? r.clips.map(card) : [h("div", { class: "empty", style: { gridColumn: "1 / -1" } }, "Nothing here yet. Render clips from a video and they will appear here.")]));
@@ -509,6 +599,183 @@ function LibraryPage() {
   }
   load();
   timer = setInterval(load, 2500);
+  return { el, destroy() { clearInterval(timer); } };
+}
+
+// ------------------------------------------------------------------ Publisher
+function PublisherPage() {
+  const list = h("div", { class: "sched-list" });
+  let timer;
+
+  const openNewSchedule = guard(async (preselectedClipId = null) => {
+    const { clips } = await api("/clips?status=ready");
+    if (!clips.length) {
+      toast("No rendered clips in the library yet. Render clips first.", true);
+      return;
+    }
+    const [ytStatus, ttStatus] = await Promise.all([
+      api("/youtube/status").catch(() => ({ connected: false })),
+      api("/tiktok/status").catch(() => ({ connected: false })),
+    ]);
+
+    const selectedClips = new Set(preselectedClipId ? [preselectedClipId] : [clips[0].id]);
+    const clipGrid = h("div", { class: "clip-selector" },
+      clips.map((c) => {
+        const item = h("div", { class: "clip-pick-item" + (selectedClips.has(c.id) ? " selected" : ""), onclick: () => {
+          if (selectedClips.has(c.id)) { if (selectedClips.size > 1) selectedClips.delete(c.id); }
+          else selectedClips.add(c.id);
+          item.classList.toggle("selected", selectedClips.has(c.id));
+          updateBtn();
+        } },
+          c.has_thumb ? h("img", { src: `/api/clips/${c.id}/thumb`, alt: "" }) : h("div", { style: { height: "70px", background: "var(--line)" } }),
+          h("div", { class: "t" }, c.title));
+        return item;
+      }));
+
+    const chkYT = h("input", { type: "checkbox", checked: ytStatus.connected });
+    const chkTT = h("input", { type: "checkbox", checked: ttStatus.connected });
+
+    const modeSelect = h("select", {}, [
+      ["time", "At a specific date and time"],
+      ["interval", "Space out evenly (e.g. 1 clip every few hours)"]
+    ].map(([v, t]) => h("option", { value: v }, t)));
+
+    // Default time is in 10 minutes
+    const nowLocal = new Date(Date.now() + 10 * 60 * 1000).toISOString().slice(0, 16);
+    const timeInput = h("input", { type: "datetime-local", value: nowLocal });
+    const intervalInput = h("input", { type: "number", value: 3, min: 1, max: 72 });
+    const timeWrap = h("div", { class: "stack", style: { marginTop: "8px" } },
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "First upload time"), timeInput));
+    const intervalWrap = h("div", { class: "stack", style: { marginTop: "8px", display: "none" } },
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Interval between clips (hours)"), intervalInput));
+
+    modeSelect.addEventListener("change", () => {
+      const isInt = modeSelect.value === "interval";
+      timeWrap.style.display = "";
+      intervalWrap.style.display = isInt ? "" : "none";
+    });
+
+    const submitBtn = h("button", { class: "btn primary", onclick: guard(async () => {
+      const platforms = [];
+      if (chkYT.checked) platforms.push("youtube");
+      if (chkTT.checked) platforms.push("tiktok");
+      if (!platforms.length) { toast("Select at least one destination platform (YouTube or TikTok).", true); return; }
+      if (!selectedClips.size) { toast("Select at least one clip.", true); return; }
+
+      const startTime = new Date(timeInput.value).getTime() / 1000;
+      if (isNaN(startTime)) { toast("Choose a valid start date and time.", true); return; }
+
+      submitBtn.disabled = true;
+      try {
+        await api("/scheduled", {
+          method: "POST",
+          json: {
+            clip_ids: Array.from(selectedClips),
+            platforms,
+            mode: modeSelect.value,
+            start_time: startTime,
+            interval_minutes: Math.max(1, parseInt(intervalInput.value, 10) * 60),
+            options: {}
+          }
+        });
+        close();
+        toast("Clips added to the publishing queue.");
+        load();
+      } finally { submitBtn.disabled = false; }
+    }) }, "Schedule uploads");
+
+    function updateBtn() {
+      submitBtn.textContent = `Schedule ${selectedClips.size} upload${selectedClips.size > 1 ? "s" : ""}`;
+    }
+    updateBtn();
+
+    const close = modal(h("div", { class: "stack" },
+      h("h2", {}, "Queue automated uploads"),
+      h("p", { class: "hint", style: { margin: 0 } }, "Select one or more clips and choose when to automatically publish them."),
+      h("div", {}, h("span", { class: "lbl", style: { fontWeight: 650 } }, "1. Select clips to publish:"), clipGrid),
+      h("div", {},
+        h("span", { class: "lbl", style: { fontWeight: 650 } }, "2. Destinations:"),
+        h("div", { class: "row", style: { marginTop: "6px", gap: "20px" } },
+          h("label", { class: "check" }, chkYT, h("span", {}, "YouTube Shorts", !ytStatus.connected ? " (Not connected)" : "")),
+          h("label", { class: "check" }, chkTT, h("span", {}, "TikTok", !ttStatus.connected ? " (Not connected)" : "")))),
+      h("div", {},
+        h("span", { class: "lbl", style: { fontWeight: 650 } }, "3. Schedule timing:"),
+        h("div", { style: { marginTop: "6px" } }, modeSelect),
+        timeWrap, intervalWrap),
+      h("div", { class: "row end", style: { marginTop: "14px" } },
+        h("button", { class: "btn", onclick: () => close() }, "Cancel"),
+        submitBtn)));
+  });
+
+  function schedCard(item) {
+    const plats = item.platforms || [];
+    const dateStr = new Date(item.scheduled_time * 1000).toLocaleString();
+    const isPast = item.scheduled_time * 1000 <= Date.now();
+    const st = item.status;
+
+    const platChips = plats.map((p) => chip(p === "youtube" ? "YouTube" : "TikTok", p === "youtube" ? "yt" : "tt"));
+    const statusChip = st === "pending" ? chip(isPast ? "Triggering..." : dateStr, "info")
+      : st === "uploading" ? chip("Uploading now...", "warn")
+      : st === "completed" ? chip("Published", "ok")
+      : chip("Failed", "err");
+
+    const res = item.results || {};
+    const links = [];
+    if (res.youtube && res.youtube.id) {
+      links.push(h("a", { class: "small", href: `https://youtu.be/${res.youtube.id}`, target: "_blank", rel: "noopener" }, "Open on YouTube"));
+    }
+    if (res.tiktok && res.tiktok.id) {
+      links.push(h("span", { class: "small muted" }, "TikTok ID: " + res.tiktok.id));
+    }
+
+    const cancelBtn = h("button", { class: "btn sm ghost danger", onclick: guard(async () => {
+      if (!confirm("Remove this scheduled upload?")) return;
+      await api(`/scheduled/${item.id}`, { method: "DELETE" });
+      load();
+    }) }, st === "completed" || st === "failed" ? "Remove" : "Cancel");
+
+    const retryBtn = st === "failed" ? h("button", { class: "btn sm", onclick: guard(async () => {
+      await api(`/scheduled/${item.id}/retry`, { method: "POST" });
+      toast("Queued for immediate retry.");
+      load();
+    }) }, "Retry now") : null;
+
+    return h("div", { class: "sched-card" },
+      item.has_thumb ? h("img", { class: "thumb", src: `/api/clips/${item.clip_id}/thumb`, alt: "" }) : h("div", { class: "thumb" }),
+      h("div", {},
+        h("div", { style: { fontWeight: 700 } }, item.clip_title || "Untitled clip"),
+        h("div", { class: "meta" }, statusChip, ...platChips, ...links),
+        item.error ? h("div", { class: "small", style: { color: "var(--err)", marginTop: "4px" } }, item.error) : null),
+      h("div", { class: "row" }, retryBtn, cancelBtn));
+  }
+
+  async function load() {
+    try {
+      const { scheduled } = await api("/scheduled");
+      list.replaceChildren(...(scheduled.length ? scheduled.map(schedCard)
+        : [h("div", { class: "empty" }, "No scheduled uploads yet. Click '+ Schedule upload' to automate your posting!")]));
+    } catch (e) { /* ignore */ }
+  }
+
+  // Handle URL query params (e.g. ?clip=123)
+  const qs = location.hash.split("?")[1] || "";
+  const params = new URLSearchParams(qs);
+  const targetClip = params.get("clip");
+  if (targetClip) {
+    history.replaceState(null, "", "#/publisher");
+    setTimeout(() => openNewSchedule(parseInt(targetClip, 10)), 300);
+  }
+
+  const el = h("div", {},
+    h("div", { class: "row between", style: { marginBottom: "16px" } },
+      h("div", {},
+        h("h1", {}, "Publisher & Scheduler"),
+        h("p", { class: "sub", style: { margin: 0 } }, "Automate and space out your video uploads to YouTube Shorts and TikTok.")),
+      h("button", { class: "btn primary", onclick: () => openNewSchedule() }, "+ Schedule uploads")),
+    list);
+
+  load();
+  timer = setInterval(load, 3000);
   return { el, destroy() { clearInterval(timer); } };
 }
 
@@ -717,8 +984,15 @@ const SCHEMA = [
   ] },
   { title: "Rendering", desc: "", fields: [
     { key: "aspect", label: "Default shape", type: "select", options: [["9:16", "Vertical 9:16"], ["1:1", "Square 1:1"], ["4:5", "Portrait 4:5"], ["16:9", "Wide 16:9"]] },
-    { key: "reframe", label: "Default framing", type: "select", options: [["face", "Follow the speaker"], ["center", "Center crop"], ["blur", "Fit with blurred background"]] },
+    { key: "reframe", label: "Default framing", type: "select", options: [["face", "Follow the speaker"], ["split", "Stacked split-screen (2 speakers)"], ["center", "Center crop"], ["blur", "Fit with blurred background"]] },
     { key: "captions", label: "Burn in captions by default", type: "bool" },
+    { key: "caption_preset", label: "Subtitle style preset", type: "select", options: [["classic", "Classic Clean"], ["hormozi", "Hormozi (Bold & Green)"], ["mrbeast", "MrBeast (High Contrast Punchy)"], ["minimal", "Minimalist (Sleek Understated)"]] },
+    { key: "caption_emojis", label: "Auto keyword emojis", type: "bool", hint: "Automatically detects viral/emotional keywords and places animated-style emojis." },
+    { key: "dynamic_zoom", label: "Dynamic punch-in retention zooms", type: "bool", hint: "Engaging 1.12x punch-in camera zooms on key speech moments for higher retention." },
+    { key: "clean_audio", label: "Audio denoise & speech cleanup", type: "bool", hint: "Removes background hum and room noise with highpass/lowpass + spectral denoising." },
+    { key: "remove_silence", label: "Dead-air silence trimmer", type: "bool", hint: "Automatically trims pauses and dead air longer than 0.6 seconds." },
+    { key: "headline_banner", label: "Show top headline banner by default (9:16 & 4:5)", type: "bool" },
+    { key: "normalize_audio", label: "Normalize loudness (-14 LUFS broadcast standard)", type: "bool", hint: "Boosts quiet voices and keeps volume consistent across devices." },
     { key: "encoder", label: "Video encoder", type: "select", options: [["auto", "Automatic"], ["libx264", "CPU (x264)"], ["h264_nvenc", "NVIDIA GPU (NVENC)"]] },
     { key: "quality", label: "Quality (lower is sharper)", type: "number", min: 14, max: 30, hint: "18 to 23 is a good range." },
     { key: "output_width", label: "Output width (pixels)", type: "number", min: 480, max: 2160, step: 60, hint: "1080 gives 1080×1920 for vertical clips." },
@@ -743,7 +1017,7 @@ const SCHEMA = [
 ];
 
 function SettingsPage(params) {
-  let settings = {}, yt = {};
+  let settings = {}, yt = {}, tiktok = {};
   const inputs = {};
   const root = h("div");
   const preview = h("div", { class: "cap-preview" });
@@ -763,8 +1037,9 @@ function SettingsPage(params) {
       const i = inputs[f.key]; if (!i) continue;
       if (f.type.startsWith("secret")) { if (i.value) body[f.key] = i.value; } else body[f.key] = readValue(f);
     }
-    for (const k of ["yt_client_id", "yt_privacy"]) if (inputs[k]) body[k] = inputs[k].value;
+    for (const k of ["yt_client_id", "yt_privacy", "tiktok_client_key", "tiktok_privacy"]) if (inputs[k]) body[k] = inputs[k].value;
     if (inputs.yt_client_secret && inputs.yt_client_secret.value) body.yt_client_secret = inputs.yt_client_secret.value;
+    if (inputs.tiktok_client_secret && inputs.tiktok_client_secret.value) body.tiktok_client_secret = inputs.tiktok_client_secret.value;
     if (inputs.yt_add_shorts_tag) body.yt_add_shorts_tag = inputs.yt_add_shorts_tag.checked;
     const r = await api("/settings", { method: "POST", json: body });
     settings = r.settings;
@@ -846,14 +1121,46 @@ function SettingsPage(params) {
         h("p", { class: "small muted" }, "While your Google app is in Testing mode, sign-in expires after 7 days and you will need to reconnect. YouTube also keeps uploads from unverified API projects private until the project passes Google's audit. Each upload uses 1,600 of the default 10,000 daily quota units, so about 6 uploads per day.")));
   }
 
+  function tiktokPanel() {
+    const dis = h("button", { class: "btn", onclick: guard(async () => { await api("/tiktok/disconnect", { method: "POST" }); toast("Disconnected from TikTok."); load(); }) }, "Disconnect");
+    const connect = h("button", { class: "btn primary", onclick: guard(async () => {
+      await save(true);
+      const r = await api("/tiktok/connect"); location.href = r.url;
+    }) }, tiktok.connected ? "Reconnect" : "Connect TikTok");
+    const keyF = { key: "tiktok_client_key", label: "TikTok Client Key", type: "text" };
+    const secF = { key: "tiktok_client_secret", label: "TikTok Client Secret", type: "secret" };
+    return h("section", { class: "panel" },
+      h("header", {}, h("h2", {}, "TikTok upload"), h("p", { class: "hint", style: { margin: 0 } }, "Direct automatic publishing via TikTok Content Posting API v2.")),
+      h("div", { class: "row", style: { marginBottom: "12px" } }, tiktok.connected ? chip("Connected", "ok") : chip("Not connected", "warn"), tiktok.connected ? dis : null),
+      h("div", { class: "fields" }, field(keyF), field(secF),
+        h("label", { class: "field" }, h("span", { class: "lbl" }, "Default privacy level"), (inputs.tiktok_privacy = h("select", {}, [
+          ["PUBLIC_TO_EVERYONE", "Public to everyone"],
+          ["MUTUAL_FOLLOW_FRIENDS", "Friends only"],
+          ["SELF_ONLY", "Only me (Private)"]
+        ].map(([v, l]) => h("option", { value: v, selected: (settings.tiktok_privacy || "PUBLIC_TO_EVERYONE") === v }, l)))))),
+      h("div", { style: { margin: "16px 0 12px" } }, connect),
+      h("details", {},
+        h("summary", { style: { cursor: "pointer", fontWeight: 650 } }, "How to configure TikTok Developer App"),
+        h("ol", { class: "small" },
+          h("li", {}, "Log into ", h("strong", {}, "developers.tiktok.com"), " and create an app with Content Posting API v2."),
+          h("li", {}, "Under Redirect Domains / URIs, add:"),
+          h("li", { style: { listStyle: "none" } }, h("div", { class: "row" }, h("code", {}, tiktok.redirect_uri || (location.origin + "/api/tiktok/callback")), h("button", { class: "btn sm", onclick: () => { navigator.clipboard && navigator.clipboard.writeText(tiktok.redirect_uri || (location.origin + "/api/tiktok/callback")); toast("Copied."); } }, "Copy"))),
+          h("li", {}, "Paste Client Key and Client Secret above, click Connect TikTok, and authorize ClipForge.")))
+    );
+  }
+
   async function load() {
-    const [s, y] = await Promise.all([api("/settings"), api("/youtube/status").catch(() => ({}))]);
-    settings = s.settings; yt = y;
+    const [s, y, tt] = await Promise.all([
+      api("/settings"),
+      api("/youtube/status").catch(() => ({})),
+      api("/tiktok/status").catch(() => ({}))
+    ]);
+    settings = s.settings; yt = y; tiktok = tt;
     for (const k of Object.keys(inputs)) delete inputs[k];
     const sections = SCHEMA.map((sec) => h("section", { class: "panel" },
       h("header", {}, h("h2", {}, sec.title), sec.desc ? h("p", { class: "hint", style: { margin: 0 } }, sec.desc) : null),
       sec.preview ? h("div", { class: "row", style: { alignItems: "flex-start", gap: "24px" } }, h("div", { class: "fields", style: { flex: 1 } }, sec.fields.map(field)), preview) : h("div", { class: "fields" }, sec.fields.map(field))));
-    sections.splice(sections.length - 1, 0, ytPanel());
+    sections.splice(sections.length - 1, 0, ytPanel(), tiktokPanel());
     root.replaceChildren(
       h("div", { class: "row between" }, h("div", {}, h("h1", {}, "Settings"), h("p", { class: "sub" }, "Keys and options are stored on the server in the data folder. Secrets are never shown again after saving.")),
         h("button", { class: "btn primary", onclick: guard(() => save()) }, "Save settings")),
@@ -872,6 +1179,9 @@ function SettingsPage(params) {
     if (params.get("yt") === "ok") toast("YouTube connected.");
     if (params.get("yt") === "error") toast("YouTube sign-in failed: " + (params.get("msg") || "unknown error"), true);
     if (params.get("yt")) history.replaceState(null, "", "#/settings");
+    if (params.get("tiktok") === "ok") toast("TikTok connected.");
+    if (params.get("tiktok") === "error") toast("TikTok sign-in failed: " + (params.get("msg") || "unknown error"), true);
+    if (params.get("tiktok")) history.replaceState(null, "", "#/settings");
   }).catch((e) => toast(e.message, true));
   return { el: root, destroy() {} };
 }

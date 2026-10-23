@@ -5,8 +5,6 @@ import gc
 
 from .. import models_mgr
 
-SENT_END = (".", "?", "!", "…", "。", "？", "！", "؟")
-
 
 def resolve_device(cfg: dict) -> tuple[str, str]:
     device = cfg.get("whisper_device", "auto")
@@ -67,24 +65,37 @@ def transcribe(audio_path: str, cfg: dict, duration: float, progress_cb) -> tupl
         return _run(model_path, audio_path, "cpu", "int8", cfg, duration, progress_cb)
 
 
+SENT_END = (".", "?", "!", "…", "。", "？", "！", "؟")
+TRAILING_PUNCT = "\"'”’»)}]> "
+
+
 def build_sentences(words: list[dict]) -> list[dict]:
-    """Group words into sentences. Each sentence knows its word index range."""
+    """Group words into coherent sentences with natural spoken boundaries."""
     sentences: list[dict] = []
     start_idx = 0
     n = len(words)
     for i, w in enumerate(words):
         gap = (words[i + 1]["s"] - w["e"]) if i + 1 < n else 99.0
-        ended = w["w"].endswith(SENT_END)
-        too_long = (w["e"] - words[start_idx]["s"]) > 20 or (i - start_idx) >= 55
-        if ended or gap > 1.2 or too_long or i == n - 1:
+        clean_word = (w.get("w") or "").rstrip(TRAILING_PUNCT)
+        ended = any(clean_word.endswith(p) for p in SENT_END)
+        cur_dur = w["e"] - words[start_idx]["s"]
+        word_count = i - start_idx + 1
+
+        clause_break = cur_dur > 8.0 and gap > 0.7 and clean_word.endswith((",", ";", ":", "—", "-"))
+        significant_pause = gap > 1.2
+        extended_pause = cur_dur > 14.0 and gap > 0.85
+        too_long = cur_dur > 25.0 or word_count >= 60
+
+        if ended or significant_pause or extended_pause or clause_break or too_long or i == n - 1:
             seg = words[start_idx:i + 1]
-            sentences.append({
-                "i": len(sentences),
-                "s": seg[0]["s"],
-                "e": seg[-1]["e"],
-                "text": " ".join(x["w"] for x in seg),
-                "w0": start_idx,
-                "w1": i,
-            })
+            if seg:
+                sentences.append({
+                    "i": len(sentences),
+                    "s": seg[0]["s"],
+                    "e": seg[-1]["e"],
+                    "text": " ".join(x["w"] for x in seg),
+                    "w0": start_idx,
+                    "w1": i,
+                })
             start_idx = i + 1
     return sentences

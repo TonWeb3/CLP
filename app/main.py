@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, db, jobs, models_mgr, youtube
+from . import config, db, jobs, models_mgr, tiktok, youtube
 from .pipeline import llm, media
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -116,11 +116,12 @@ def _video_row(v: dict) -> dict:
 def _clip_row(c: dict) -> dict:
     keys = ("id", "video_id", "video_title", "rank", "score", "title", "hook", "reason", "start", "end", "selected",
             "status", "progress", "error", "width", "height", "size", "yt_status", "yt_progress", "yt_id",
-            "yt_error", "created", "updated")
-    out = {k: c[k] for k in keys}
-    out["selected"] = bool(c["selected"])
+            "yt_error", "tiktok_status", "tiktok_progress", "tiktok_id", "tiktok_error", "created", "updated")
+    out = {k: c.get(k) for k in keys}
+    out["selected"] = bool(c.get("selected"))
     out["has_thumb"] = bool(c.get("thumb_path") and Path(c["thumb_path"]).exists())
     out["path"] = c.get("path")
+    out["social_copy"] = json.loads(c["social_copy"]) if c.get("social_copy") else None
     return out
 
 
@@ -158,6 +159,7 @@ def health():
         "llm": None,
         "llm_models": [],
         "youtube_connected": youtube.connected(),
+        "tiktok_connected": tiktok.connected(),
         "clips_dir": str(config.clips_dir()),
         "data_dir": str(config.DATA_DIR),
     }
@@ -366,6 +368,13 @@ class RenderBody(BaseModel):
     aspect: str | None = None
     reframe: str | None = None
     captions: bool | None = None
+    caption_preset: str | None = None
+    caption_emojis: bool | None = None
+    headline: bool | None = None
+    normalize_audio: bool | None = None
+    clean_audio: bool | None = None
+    dynamic_zoom: bool | None = None
+    remove_silence: bool | None = None
 
 
 @app.post("/api/videos/{vid}/render")
@@ -376,8 +385,10 @@ def render_clips(vid: int, body: RenderBody):
     opts = {k: val for k, val in body.model_dump().items() if k != "clip_ids" and val is not None}
     if opts.get("aspect") not in (None, "9:16", "1:1", "4:5", "16:9"):
         raise HTTPException(400, "Unknown aspect ratio")
-    if opts.get("reframe") not in (None, "face", "center", "blur"):
+    if opts.get("reframe") not in (None, "face", "split", "center", "blur"):
         raise HTTPException(400, "Unknown reframe mode")
+    if opts.get("caption_preset") not in (None, "classic", "hormozi", "mrbeast", "minimalist"):
+        raise HTTPException(400, "Unknown caption preset")
     n = 0
     for cid in body.clip_ids:
         c = db.one("SELECT * FROM clips WHERE id=? AND video_id=?", (cid, vid))
@@ -504,6 +515,177 @@ def upload_clip(cid: int, body: UploadBody):
         else:
             desc = (desc + "\n\n#Shorts").strip()
     jobs.start_upload(cid, title, desc, body.tags, body.privacy)
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# TikTok upload & connection
+# --------------------------------------------------------------------------
+class TikTokUploadBody(BaseModel):
+    title: str
+    privacy: str = "PUBLIC_TO_EVERYONE"
+
+
+@app.post("/api/clips/{cid}/tiktok")
+def upload_clip_tiktok(cid: int, body: TikTokUploadBody):
+    c = _get_clip(cid)
+    if c["status"] != "ready" or not c["path"]:
+        raise HTTPException(400, "Render the clip first.")
+    if c.get("tiktok_status") == "uploading":
+        raise HTTPException(400, "Already uploading to TikTok.")
+    if not tiktok.connected():
+        raise HTTPException(400, "TikTok is not connected. Connect it in Settings.")
+    jobs.start_tiktok_upload(cid, body.title.strip(), body.privacy)
+    return {"ok": True}
+
+
+@app.get("/api/tiktok/status")
+def tiktok_status_api(request: Request):
+    cfg = config.get()
+    return {
+        "connected": tiktok.connected(),
+        "has_keys": bool(cfg.get("tiktok_client_key") and cfg.get("tiktok_client_secret")),
+        "redirect_uri": tiktok.redirect_uri_for(str(request.base_url)),
+    }
+
+
+@app.get("/api/tiktok/connect")
+def tiktok_connect_api(request: Request):
+    try:
+        url = tiktok.auth_url(config.get(), tiktok.redirect_uri_for(str(request.base_url)))
+    except tiktok.TikTokError as e:
+        raise HTTPException(400, str(e))
+    return {"url": url}
+
+
+@app.get("/api/tiktok/callback")
+def tiktok_callback_api(request: Request, state: str = "", code: str = "", error: str = "", error_description: str = ""):
+    if error or not code:
+        err_msg = error_description or error or "Sign-in was cancelled"
+        return RedirectResponse(f"/#/settings?tiktok=error&msg={quote(err_msg)}")
+    try:
+        tiktok.finish(state, code, tiktok.redirect_uri_for(str(request.base_url)))
+    except Exception as e:  # noqa: BLE001
+        return RedirectResponse(f"/#/settings?tiktok=error&msg={quote(str(e)[:200])}")
+    return RedirectResponse("/#/settings?tiktok=ok")
+
+
+@app.post("/api/tiktok/disconnect")
+def tiktok_disconnect_api():
+    tiktok.disconnect()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# AI Social Post Copy Generator
+# --------------------------------------------------------------------------
+@app.post("/api/clips/{cid}/social-copy")
+def generate_social_copy_api(cid: int):
+    c = _get_clip(cid)
+    v = _get_video(c["video_id"])
+    words = []
+    if v.get("transcript_path") and Path(v["transcript_path"]).exists():
+        try:
+            words = json.loads(Path(v["transcript_path"]).read_text("utf-8")).get("words", [])
+        except Exception:
+            pass
+    clip_words = [w["w"] for w in words if w.get("e", 0) > c["start"] and w.get("s", 0) < c["end"]]
+    snippet = " ".join(clip_words) if clip_words else (c.get("hook") or c.get("title") or "")
+    try:
+        copy_data = llm.generate_social_post(config.get(), c.get("title") or "Clip", c.get("hook") or "", snippet)
+        db.update("clips", cid, social_copy=json.dumps(copy_data))
+        return {"ok": True, "social_copy": copy_data}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+# --------------------------------------------------------------------------
+# Scheduled Automated Publishing
+# --------------------------------------------------------------------------
+class ScheduleCreate(BaseModel):
+    clip_ids: list[int]
+    platforms: list[str]  # e.g. ["youtube", "tiktok"]
+    mode: str = "time"  # "time" or "interval"
+    start_time: float  # unix timestamp
+    interval_minutes: int = 60
+    options: dict = {}
+
+
+@app.get("/api/scheduled")
+def list_scheduled():
+    rows = db.q(
+        "SELECT s.*, c.title AS clip_title, c.thumb_path, (c.end - c.start) AS clip_dur, c.width, c.height, "
+        "c.video_title, c.path AS clip_path "
+        "FROM scheduled_uploads s "
+        "LEFT JOIN clips c ON s.clip_id = c.id "
+        "ORDER BY s.scheduled_time ASC"
+    )
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["platforms"] = json.loads(d["platforms"] or "[]")
+        d["options"] = json.loads(d["options"] or "{}")
+        d["results"] = json.loads(d["results"] or "{}")
+        d["has_thumb"] = bool(d.get("thumb_path") and Path(d["thumb_path"]).exists())
+        out.append(d)
+    return {"scheduled": out}
+
+
+@app.post("/api/scheduled")
+def create_scheduled(body: ScheduleCreate):
+    if not body.clip_ids:
+        raise HTTPException(400, "No clips selected.")
+    if not body.platforms:
+        raise HTTPException(400, "Select at least one platform (YouTube or TikTok).")
+
+    start_t = max(time.time(), float(body.start_time))
+    interval_sec = max(1, int(body.interval_minutes)) * 60
+    created_ids = []
+
+    for idx, cid in enumerate(body.clip_ids):
+        c = db.one("SELECT * FROM clips WHERE id=?", (cid,))
+        if not c or c["status"] != "ready":
+            continue
+        sch_time = start_t + (idx * interval_sec if body.mode == "interval" else 0)
+
+        clip_opts = dict(body.options)
+        # Ensure default title if not provided
+        if "youtube" in body.platforms and "youtube" not in clip_opts:
+            clip_opts["youtube"] = {"title": c["title"], "privacy": "private"}
+        if "tiktok" in body.platforms and "tiktok" not in clip_opts:
+            clip_opts["tiktok"] = {"title": c["title"], "privacy": "PUBLIC_TO_EVERYONE"}
+
+        sid = db.insert(
+            "scheduled_uploads",
+            clip_id=cid,
+            platforms=json.dumps(body.platforms),
+            scheduled_time=sch_time,
+            status="pending",
+            options=json.dumps(clip_opts),
+            results="{}",
+        )
+        created_ids.append(sid)
+
+    return {"created": len(created_ids), "ids": created_ids}
+
+
+@app.delete("/api/scheduled/{sched_id}")
+def delete_scheduled(sched_id: int):
+    row = db.one("SELECT * FROM scheduled_uploads WHERE id=?", (sched_id,))
+    if not row:
+        raise HTTPException(404, "Scheduled upload not found")
+    if row["status"] == "uploading":
+        raise HTTPException(400, "Cannot delete an upload currently in progress.")
+    db.ex("DELETE FROM scheduled_uploads WHERE id=?", (sched_id,))
+    return {"ok": True}
+
+
+@app.post("/api/scheduled/{sched_id}/retry")
+def retry_scheduled(sched_id: int):
+    row = db.one("SELECT * FROM scheduled_uploads WHERE id=?", (sched_id,))
+    if not row:
+        raise HTTPException(404, "Scheduled upload not found")
+    db.update("scheduled_uploads", sched_id, status="pending", scheduled_time=time.time(), error=None)
     return {"ok": True}
 
 

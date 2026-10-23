@@ -57,15 +57,32 @@ RANK_SCHEMA = {
     "required": ["ranking"],
 }
 
-CRITERIA = """What makes a great short clip:
-- It opens with a hook in the first sentence: a surprising claim, a bold opinion, a question, the start of a story, or strong emotion.
-- It stands alone. Someone who has not seen the rest of the video understands it.
-- It has an arc with a payoff: a punchline, a reveal, a lesson, or a clear takeaway.
-- It contains an emotional peak, humor, controversy, or a genuinely useful insight.
-- It ends on a natural conclusion, not mid-thought.
+CRITERIA = """VIRAL SHORT-FORM RETENTION & ENGAGEMENT FRAMEWORK (TikTok, Shorts, Reels):
 
-Avoid: intros and outros, sponsor reads, small talk, rambling, anything that depends on earlier context, and clips that begin with filler like "so", "um" or "yeah".
-Be a harsh judge. Most moments deserve a score below 7. Reserve 9-10 for clips you are confident would perform well."""
+1. THE 3-SECOND RETENTION HOOK:
+   - The opening line MUST trigger an immediate pattern interrupt or curiosity gap. Viewers decide to swipe within 2-3 seconds.
+   - It should fit one of the 4 proven Viral Archetypes:
+     * [Controversial] Challenges a common myth, popular belief, or status quo with a bold contrarian stance.
+     * [Story/Confession] A dramatic personal turning point, failure, high-stakes moment, or shocking reveal.
+     * [Actionable Insight] A practical "cheat code" or framework that gives viewers an immediate unfair advantage.
+     * [Curiosity/Mystery] Poses an intriguing question or startling observation that compels viewers to watch till the end.
+   - Strip out rambling preamble, small talk, or filler ("so um", "like I said", "you know"). Start right on the core statement.
+
+2. COMPLETE INFORMATION & SELF-CONTAINED THOUGHT:
+   - The clip must deliver a complete, coherent narrative or lesson from start to finish.
+   - A viewer with zero prior context must fully understand the message without missing background info.
+   - If a premise or question is raised, the clip MUST include the full explanation and conclusion.
+   - NEVER end mid-sentence, mid-thought, mid-argument, or on transition words ("because...", "and so...", "which means...").
+
+3. SATISFYING PAYOFF:
+   - Concludes on a memorable punchline, decisive realization, clear lesson, or natural resolution.
+   - The ending must feel like a completed loop, leaving the viewer satisfied and likely to share or save.
+
+4. HIGH-CTR CURIOSITY-GAP TITLES:
+   - Formatted like viral YouTube Shorts / TikTok headlines (high curiosity, strong contrast, under 60 characters).
+   - Capitalize key words (e.g. "The Brutal Truth About Money", "Why 99% Of People Fail At X", "The 1 Habit That Changed Everything").
+
+Avoid: Slow ramp-ups, clips cut off mid-thought, small talk, sponsor reads, and rambling without a payoff."""
 
 
 def fmt_ts(sec: float) -> str:
@@ -75,8 +92,8 @@ def fmt_ts(sec: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def make_chunks(sentences: list[dict], chunk_sec: float, overlap: int = 6) -> list[tuple[int, int]]:
-    """Index ranges [i, j) covering the transcript, with a small overlap between chunks."""
+def make_chunks(sentences: list[dict], chunk_sec: float, overlap: int = 8) -> list[tuple[int, int]]:
+    """Index ranges [i, j) covering the transcript, with a generous overlap between chunks."""
     chunks = []
     n = len(sentences)
     i = 0
@@ -93,7 +110,7 @@ def make_chunks(sentences: list[dict], chunk_sec: float, overlap: int = 6) -> li
 
 
 def normalize_span(a: int, b: int, sentences: list[dict], lo: int, hi: int, min_s: float, max_s: float):
-    """Clamp a proposed sentence range into [lo, hi) and into the allowed duration."""
+    """Clamp a proposed sentence range into [lo, hi) ensuring complete thoughts and clean cuts."""
     a = max(lo, min(a, hi - 1))
     b = max(lo, min(b, hi - 1))
     if b < a:
@@ -102,12 +119,23 @@ def normalize_span(a: int, b: int, sentences: list[dict], lo: int, hi: int, min_
     def dur(x, y):
         return sentences[y]["e"] - sentences[x]["s"]
 
-    while b > a and dur(a, b) > max_s:
-        b -= 1
-    n = len(sentences)
-    while dur(a, b) < min_s and b + 1 < n and dur(a, b + 1) <= max_s:
+    # Allow a small buffer (up to 8% over max_s) to preserve a complete final sentence/payoff
+    effective_max = max_s * 1.08
+
+    # If too long, determine whether trimming leading preamble or trailing sentence preserves completeness better
+    while b > a and dur(a, b) > effective_max:
+        # Check if the opening sentence is short preamble (< 5.5s) and trimming it keeps duration valid
+        if (b - a) >= 2 and (sentences[a]["e"] - sentences[a]["s"]) < 5.5 and dur(a + 1, b) >= min_s:
+            a += 1
+        else:
+            b -= 1
+
+    # If too short, only extend if the next sentence fits and doesn't overshoot
+    while dur(a, b) < min_s and b + 1 < hi and dur(a, b + 1) <= effective_max:
         b += 1
-    if dur(a, b) < min_s * 0.6 or dur(a, b) > max_s * 1.15:
+
+    d = dur(a, b)
+    if d < min_s * 0.7 or d > max_s * 1.15:
         return None
     return a, b
 
@@ -124,17 +152,19 @@ def propose(cfg, sentences, chunk, min_s, max_s, want):
     lo, hi = chunk
     lines = [f"[{s['i']}] {fmt_ts(s['s'])} {s['text']}" for s in sentences[lo:hi]]
     system = (
-        "You are an expert short-form video editor. You find the moments in long videos (podcasts, interviews, "
-        "talks, streams, sermons) that would perform best on TikTok, Instagram Reels and YouTube Shorts.\n\n"
+        "You are an elite short-form video editor specializing in viral clips for TikTok, YouTube Shorts, and Instagram Reels.\n\n"
         + CRITERIA +
-        f"\n\nRules:\n- Each clip must last between {int(min_s)} and {int(max_s)} seconds. Timestamps are shown on every line.\n"
-        f"- Return at most {want} clips from this section. Return fewer, or none, if the section has no strong moments.\n"
-        "- start_sentence is the sentence where the hook actually begins. end_sentence is the last sentence of the payoff.\n"
-        "- Clips must not overlap each other.\n"
-        "- Write title and hook in the same language as the transcript. The title is under 70 characters, honest, and "
-        "makes people curious. The hook is the opening line, copied from the transcript.\n"
-        "- reason is one short sentence on why this works.\n"
-        "- score is 1-10."
+        f"\n\nRules:\n- Target duration: each clip MUST last between {int(min_s)} and {int(max_s)} seconds. Check the timestamps!\n"
+        f"- Completeness is mandatory: Choose `start_sentence` and `end_sentence` so the clip delivers a 100% complete thought. "
+        "Do NOT cut off before the explanation or story finishes.\n"
+        f"- Return at most {want} clips from this section. Return fewer, or none, if the section has no viral moments.\n"
+        "- start_sentence: The sentence where the hook/topic starts cleanly.\n"
+        "- end_sentence: The sentence where the idea concludes with a satisfying payoff.\n"
+        "- title: Punchy, high-CTR viral title (under 60 characters, curiosity-driven, capitalize key words).\n"
+        "- hook: The exact opening spoken line that grabs attention, copied from the transcript.\n"
+        "- reason: Format as '[Archetype] Explanation' (e.g. '[Controversial] Debunks myth about X with proof').\n"
+        "- score: 1-10 based on hook strength, viral potential, and complete payoff.\n"
+        "- Clips must not overlap each other."
     )
     user = (f"Transcript section from {fmt_ts(sentences[lo]['s'])} to {fmt_ts(sentences[hi - 1]['e'])}. "
             "Each line is: [sentence number] timestamp text\n\n" + "\n".join(lines))
@@ -148,12 +178,17 @@ def rank(cfg, sentences, cands, want):
         dur = int(c["end"] - c["start"])
         items.append(f"ID {k} ({dur}s): {_clip_text(sentences, c['a'], c['b'], 700)}")
     system = (
-        "You are the final judge for a short-form video channel. You are given candidate clips from one long video. "
-        "Pick the best ones and rank them from best to worst.\n\n" + CRITERIA +
-        f"\n\nReturn the best {min(want, len(cands))} clips, best first. For each: id (as given), score 1-10 "
-        "(use the full range and separate strong clips from weak ones), a better title if you can improve it (under 70 "
-        "characters, honest, curiosity-driven), the hook (the first spoken line that grabs attention, copied from the "
-        "text), and a one-sentence reason. Use the same language as the clips."
+        "You are the executive producer and final judge for a viral short-form channel. You are given candidate clips "
+        "from one long video. Rank them by viral potential, retention, and completeness.\n\n" + CRITERIA +
+        f"\n\nRules:\n"
+        f"- Prioritize clips with an explosive 3-second hook, high retention potential, and a complete, satisfying payoff.\n"
+        f"- Heavily penalize or discard any candidate that starts slowly, rambles, or feels cut off mid-thought.\n"
+        f"- Return the best {min(want, len(cands))} clips, best first. For each:\n"
+        "  * id: as given\n"
+        "  * score: 1-10 (differentiate viral home runs from average clips)\n"
+        "  * title: an improved, curiosity-gap viral title (under 60 characters)\n"
+        "  * hook: the opening spoken line\n"
+        "  * reason: '[Archetype] Why this will hook viewers and retain them'"
     )
     user = "Candidates:\n\n" + "\n\n".join(items)
     data = llm.chat_json(cfg, cfg["_ranker_model"], system, user, RANK_SCHEMA)
@@ -223,10 +258,26 @@ def find_clips(cfg: dict, sentences: list[dict], duration: float, curve: list[fl
             if not span:
                 continue
             a, b = span
+            # Intelligent speech padding: ensure full breath before first syllable and complete vocal decay at end
+            if a > 0:
+                gap_before = max(0.0, sentences[a]["s"] - sentences[a - 1]["e"])
+                pad_start = min(0.35, max(0.12, gap_before * 0.45))
+            else:
+                pad_start = 0.25
+
+            if b + 1 < len(sentences):
+                gap_after = max(0.0, sentences[b + 1]["s"] - sentences[b]["e"])
+                pad_end = min(0.65, max(0.20, gap_after * 0.55))
+            else:
+                pad_end = 0.50
+
+            clip_start = max(0.0, round(sentences[a]["s"] - pad_start, 2))
+            clip_end = min(duration or 1e9, round(sentences[b]["e"] + pad_end, 2))
+
             cands.append({
                 "a": a, "b": b,
-                "start": max(0.0, sentences[a]["s"] - 0.15),
-                "end": min(duration or 1e9, sentences[b]["e"] + 0.4),
+                "start": clip_start,
+                "end": clip_end,
                 "p1": min(10.0, max(1.0, float(p.get("score") or 5))),
                 "title": (p.get("title") or "").strip()[:100],
                 "hook": (p.get("hook") or "").strip(),

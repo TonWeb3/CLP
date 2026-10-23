@@ -10,7 +10,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import config, db, models_mgr, youtube
+from . import config, db, models_mgr, tiktok, youtube
 from .pipeline import analyze, download, media, render, transcribe
 
 log = logging.getLogger("clipforge.jobs")
@@ -46,6 +46,7 @@ def start() -> None:
     _started = True
     _recover()
     threading.Thread(target=_loop, daemon=True, name="clipforge-worker").start()
+    threading.Thread(target=_scheduler_loop, daemon=True, name="clipforge-scheduler").start()
 
 
 def _recover() -> None:
@@ -57,6 +58,10 @@ def _recover() -> None:
           ("Interrupted when the server restarted. Render it again.",))
     db.ex("UPDATE clips SET yt_status='failed', yt_error=? WHERE yt_status='uploading'",
           ("Interrupted when the server restarted. Upload again.",))
+    db.ex("UPDATE clips SET tiktok_status='failed', tiktok_error=? WHERE tiktok_status='uploading'",
+          ("Interrupted when the server restarted. Upload again.",))
+    db.ex("UPDATE scheduled_uploads SET status='failed', error=? WHERE status='uploading'",
+          ("Interrupted when the server restarted.",))
 
 
 def _loop() -> None:
@@ -192,7 +197,7 @@ def _run_render(clip_id: int) -> None:
 
 
 # --------------------------------------------------------------------------
-# YouTube upload (own thread per upload, independent of the GPU worker)
+# YouTube & TikTok uploads (own thread per upload, independent of the GPU worker)
 # --------------------------------------------------------------------------
 def start_upload(clip_id: int, title: str, description: str, tags: list[str], privacy: str) -> None:
     db.update("clips", clip_id, yt_status="uploading", yt_progress=0.0, yt_error=None)
@@ -206,6 +211,100 @@ def start_upload(clip_id: int, title: str, description: str, tags: list[str], pr
         except Exception as e:  # noqa: BLE001
             log.error("upload failed for clip %s: %s", clip_id, e)
             db.update("clips", clip_id, yt_status="failed", yt_error=str(e)[:500])
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def start_tiktok_upload(clip_id: int, title: str, privacy: str) -> None:
+    db.update("clips", clip_id, tiktok_status="uploading", tiktok_progress=0.0, tiktok_error=None)
+
+    def run():
+        c = db.one("SELECT * FROM clips WHERE id=?", (clip_id,))
+        try:
+            publish_id = tiktok.upload(config.get(), c["path"], title, privacy,
+                                       lambda f: db.update("clips", clip_id, tiktok_progress=round(f, 3)))
+            db.update("clips", clip_id, tiktok_status="done", tiktok_progress=1.0, tiktok_id=publish_id, tiktok_error=None)
+        except Exception as e:  # noqa: BLE001
+            log.error("TikTok upload failed for clip %s: %s", clip_id, e)
+            db.update("clips", clip_id, tiktok_status="failed", tiktok_error=str(e)[:500])
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+# --------------------------------------------------------------------------
+# Scheduled Automated Publishing
+# --------------------------------------------------------------------------
+def _scheduler_loop() -> None:
+    while True:
+        try:
+            now = time.time()
+            rows = db.q(
+                "SELECT * FROM scheduled_uploads WHERE status='pending' AND scheduled_time <= ? ORDER BY scheduled_time ASC",
+                (now,),
+            )
+            for item in rows:
+                _process_scheduled_upload(item)
+        except Exception:  # noqa: BLE001
+            log.error("scheduler error: %s", traceback.format_exc())
+        time.sleep(15)
+
+
+def _process_scheduled_upload(item: dict) -> None:
+    sched_id = item["id"]
+    db.update("scheduled_uploads", sched_id, status="uploading")
+    clip = db.one("SELECT * FROM clips WHERE id=?", (item["clip_id"],))
+    if not clip or clip["status"] != "ready" or not clip.get("path") or not Path(clip["path"]).exists():
+        db.update("scheduled_uploads", sched_id, status="failed", error="Rendered clip file not found")
+        return
+
+    def run():
+        try:
+            cfg = config.get()
+            platforms = json.loads(item["platforms"] or "[]")
+            opts = json.loads(item["options"] or "{}")
+            results = {}
+            all_ok = True
+
+            # YouTube
+            if "youtube" in platforms:
+                yt_opts = opts.get("youtube") or {}
+                yt_title = yt_opts.get("title") or clip["title"]
+                yt_desc = yt_opts.get("description", "")
+                yt_tags = yt_opts.get("tags", [])
+                yt_priv = yt_opts.get("privacy", "private")
+                if yt_opts.get("add_shorts_tag", True) and "#shorts" not in (yt_title + yt_desc).lower():
+                    if len(yt_title) + 8 <= 100:
+                        yt_title += " #Shorts"
+                    else:
+                        yt_desc = (yt_desc + "\n\n#Shorts").strip()
+                try:
+                    vid_id = youtube.upload(cfg, clip["path"], yt_title, yt_desc, yt_tags, yt_priv, lambda _f: None)
+                    results["youtube"] = {"ok": True, "id": vid_id}
+                    db.update("clips", clip["id"], yt_status="done", yt_progress=1.0, yt_id=vid_id, yt_error=None)
+                except Exception as e:
+                    results["youtube"] = {"ok": False, "error": str(e)[:300]}
+                    all_ok = False
+                    db.update("clips", clip["id"], yt_status="failed", yt_error=str(e)[:500])
+
+            # TikTok
+            if "tiktok" in platforms:
+                tt_opts = opts.get("tiktok") or {}
+                tt_title = tt_opts.get("title") or clip["title"]
+                tt_priv = tt_opts.get("privacy", "PUBLIC_TO_EVERYONE")
+                try:
+                    pub_id = tiktok.upload(cfg, clip["path"], tt_title, tt_priv, lambda _f: None)
+                    results["tiktok"] = {"ok": True, "id": pub_id}
+                    db.update("clips", clip["id"], tiktok_status="done", tiktok_progress=1.0, tiktok_id=pub_id, tiktok_error=None)
+                except Exception as e:
+                    results["tiktok"] = {"ok": False, "error": str(e)[:300]}
+                    all_ok = False
+                    db.update("clips", clip["id"], tiktok_status="failed", tiktok_error=str(e)[:500])
+
+            status = "completed" if all_ok else ("failed" if not any(r.get("ok") for r in results.values()) else "partial")
+            db.update("scheduled_uploads", sched_id, status=status, results=json.dumps(results), error=None if all_ok else "One or more uploads failed")
+        except Exception as e:
+            log.error("scheduled upload %s crashed: %s", sched_id, e)
+            db.update("scheduled_uploads", sched_id, status="failed", error=str(e)[:500])
 
     threading.Thread(target=run, daemon=True).start()
 
