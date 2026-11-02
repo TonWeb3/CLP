@@ -1,4 +1,4 @@
-"""TikTok sign-in (OAuth 2.0) and direct video publishing via TikTok Content Posting API v2."""
+"""TikTok sign-in (OAuth 2.0) and direct video publishing via TikTok Content Posting API v2 (multi-account)."""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 
 import requests
 
-from . import config
+from . import config, db
 
 log = logging.getLogger("clipforge.tiktok")
 TOKEN_FILE = config.DATA_DIR / "tiktok_token.json"
@@ -21,7 +21,7 @@ TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 TIKTOK_POST_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/"
 TIKTOK_STATUS_URL = "https://open.tiktokapis.com/v2/post/publish/status_fetch/"
 
-_states: dict[str, float] = {}
+_states: dict[str, tuple[float, int | None]] = {}
 _lock = threading.Lock()
 
 
@@ -29,24 +29,56 @@ class TikTokError(RuntimeError):
     pass
 
 
+def token_path(account_id: int | None = None) -> Path:
+    if account_id is not None:
+        return config.DATA_DIR / "tokens" / f"tiktok_{int(account_id)}.json"
+    return TOKEN_FILE
+
+
+def _resolve_account(cfg_or_acc: dict | int | None = None) -> dict:
+    if isinstance(cfg_or_acc, int):
+        acc = db.one("SELECT * FROM social_accounts WHERE id=? AND platform='tiktok'", (cfg_or_acc,))
+        if not acc:
+            raise TikTokError("TikTok account not found.")
+        return acc
+    if isinstance(cfg_or_acc, dict) and ("client_id" in cfg_or_acc or "id" in cfg_or_acc):
+        return cfg_or_acc
+    rows = db.q("SELECT * FROM social_accounts WHERE platform='tiktok' ORDER BY id ASC")
+    for r in rows:
+        if token_path(r["id"]).exists():
+            return r
+    if rows:
+        return rows[0]
+    cfg = cfg_or_acc if isinstance(cfg_or_acc, dict) else config.get()
+    return {
+        "id": None,
+        "name": "TikTok",
+        "client_id": cfg.get("tiktok_client_key", ""),
+        "client_secret": cfg.get("tiktok_client_secret", ""),
+        "privacy": cfg.get("tiktok_privacy", "PUBLIC_TO_EVERYONE"),
+    }
+
+
 def redirect_uri_for(base_url: str) -> str:
     return base_url.rstrip("/") + "/api/tiktok/callback"
 
 
-def auth_url(cfg: dict, redirect_uri: str) -> str:
-    key = cfg.get("tiktok_client_key", "").strip()
-    secret = cfg.get("tiktok_client_secret", "").strip()
+def auth_url(cfg_or_acc: dict | int, redirect_uri: str) -> str:
+    acc = _resolve_account(cfg_or_acc)
+    key = (acc.get("client_id") or acc.get("tiktok_client_key") or "").strip()
+    secret = (acc.get("client_secret") or acc.get("tiktok_client_secret") or "").strip()
     if not key or not secret:
-        raise TikTokError("Add your TikTok Client Key and Client Secret in Settings first.")
+        name = acc.get("name") or "TikTok"
+        raise TikTokError(f"Add your TikTok Client Key and Client Secret for '{name}' in Settings first.")
 
     state = secrets.token_urlsafe(24)
     with _lock:
         now = time.time()
         # Clean up stale states (>1 hour)
-        expired = [k for k, t in _states.items() if now - t > 3600]
+        expired = [k for k, v in _states.items() if now - (v[0] if isinstance(v, tuple) else v) > 3600]
         for k in expired:
             _states.pop(k, None)
-        _states[state] = now
+        _states[state] = (now, acc.get("id"))
 
     params = {
         "client_key": key,
@@ -58,15 +90,18 @@ def auth_url(cfg: dict, redirect_uri: str) -> str:
     return f"{TIKTOK_AUTH_URL}?{urlencode(params)}"
 
 
-def finish(state: str, code: str, redirect_uri: str) -> None:
+def finish(state: str, code: str, redirect_uri: str) -> int | None:
     with _lock:
-        saved_time = _states.pop(state, None)
-    if not saved_time or (time.time() - saved_time > 3600):
+        entry = _states.pop(state, None)
+    if not entry:
+        raise TikTokError("This sign-in link has expired. Start the connection again from Settings.")
+    saved_time, account_id = entry if isinstance(entry, tuple) else (entry, None)
+    if time.time() - saved_time > 3600:
         raise TikTokError("This sign-in link has expired. Start the connection again from Settings.")
 
-    cfg = config.get()
-    key = cfg.get("tiktok_client_key", "").strip()
-    secret = cfg.get("tiktok_client_secret", "").strip()
+    acc = _resolve_account(account_id)
+    key = (acc.get("client_id") or acc.get("tiktok_client_key") or "").strip()
+    secret = (acc.get("client_secret") or acc.get("tiktok_client_secret") or "").strip()
     if not key or not secret:
         raise TikTokError("TikTok Client Key or Secret missing from Settings.")
 
@@ -89,29 +124,44 @@ def finish(state: str, code: str, redirect_uri: str) -> None:
 
     token_data = data["data"]
     token_data["created_at"] = time.time()
-    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TOKEN_FILE.write_text(json.dumps(token_data, indent=2), "utf-8")
+    tpath = token_path(account_id)
+    tpath.parent.mkdir(parents=True, exist_ok=True)
+    tpath.write_text(json.dumps(token_data, indent=2), "utf-8")
     try:
-        os.chmod(TOKEN_FILE, 0o600)
+        os.chmod(tpath, 0o600)
     except OSError:
         pass
+    return account_id
 
 
-def connected() -> bool:
+def connected(account_id: int | None = None) -> bool:
+    if account_id is not None:
+        return token_path(account_id).exists()
+    rows = db.q("SELECT id FROM social_accounts WHERE platform='tiktok'")
+    if any(token_path(r["id"]).exists() for r in rows):
+        return True
     return TOKEN_FILE.exists()
 
 
-def disconnect() -> None:
-    TOKEN_FILE.unlink(missing_ok=True)
+def disconnect(account_id: int | None = None) -> None:
+    if account_id is not None:
+        token_path(account_id).unlink(missing_ok=True)
+    else:
+        TOKEN_FILE.unlink(missing_ok=True)
 
 
-def _get_access_token(cfg: dict) -> str:
-    if not TOKEN_FILE.exists():
-        raise TikTokError("TikTok is not connected. Connect it in Settings.")
+def _get_access_token(acc: dict) -> str:
+    tpath = token_path(acc.get("id"))
+    if not tpath.exists() and TOKEN_FILE.exists():
+        tpath = TOKEN_FILE
+    if not tpath.exists():
+        name = acc.get("name") or "TikTok"
+        raise TikTokError(f"TikTok account '{name}' is not connected. Connect it in Settings.")
     try:
-        data = json.loads(TOKEN_FILE.read_text("utf-8"))
+        data = json.loads(tpath.read_text("utf-8"))
     except Exception as e:
-        raise TikTokError("Failed to read TikTok token. Please reconnect in Settings.") from e
+        name = acc.get("name") or "TikTok"
+        raise TikTokError(f"Failed to read token for '{name}'. Please reconnect in Settings.") from e
 
     token = data.get("access_token")
     expires_in = data.get("expires_in", 86400)
@@ -119,8 +169,8 @@ def _get_access_token(cfg: dict) -> str:
 
     # If within 5 minutes of expiring, refresh
     if time.time() - created_at > (expires_in - 300) and data.get("refresh_token"):
-        key = cfg.get("tiktok_client_key", "").strip()
-        secret = cfg.get("tiktok_client_secret", "").strip()
+        key = (acc.get("client_id") or acc.get("tiktok_client_key") or "").strip()
+        secret = (acc.get("client_secret") or acc.get("tiktok_client_secret") or "").strip()
         resp = requests.post(
             TIKTOK_TOKEN_URL,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -136,17 +186,18 @@ def _get_access_token(cfg: dict) -> str:
         if resp.status_code == 200 and refresh_data.get("data", {}).get("access_token"):
             data.update(refresh_data["data"])
             data["created_at"] = time.time()
-            TOKEN_FILE.write_text(json.dumps(data, indent=2), "utf-8")
+            tpath.write_text(json.dumps(data, indent=2), "utf-8")
             token = data["access_token"]
         else:
             log.warning("TikTok token refresh failed; trying existing access token")
 
     if not token:
-        raise TikTokError("TikTok token expired or missing. Reconnect in Settings.")
+        name = acc.get("name") or "TikTok"
+        raise TikTokError(f"TikTok token for '{name}' expired or missing. Reconnect in Settings.")
     return token
 
 
-def upload(cfg: dict, video_path: str | Path, title: str, privacy: str, progress_cb) -> str:
+def upload(cfg_or_acc: dict | int, video_path: str | Path, title: str, privacy: str, progress_cb) -> str:
     """Uploads a video to TikTok using the Content Posting API v2.
     Returns publish_id.
     """
@@ -158,7 +209,8 @@ def upload(cfg: dict, video_path: str | Path, title: str, privacy: str, progress
     if file_size < 100:
         raise TikTokError("Video file is empty or corrupted.")
 
-    token = _get_access_token(cfg)
+    acc = _resolve_account(cfg_or_acc)
+    token = _get_access_token(acc)
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=UTF-8",
@@ -166,7 +218,8 @@ def upload(cfg: dict, video_path: str | Path, title: str, privacy: str, progress
 
     # Allowed privacy levels: PUBLIC_TO_EVERYONE, MUTUAL_FOLLOW_FRIENDS, SELF_ONLY
     valid_privacy = ("PUBLIC_TO_EVERYONE", "MUTUAL_FOLLOW_FRIENDS", "SELF_ONLY")
-    priv = privacy if privacy in valid_privacy else cfg.get("tiktok_privacy", "PUBLIC_TO_EVERYONE")
+    default_priv = acc.get("privacy") or "PUBLIC_TO_EVERYONE"
+    priv = privacy if privacy in valid_privacy else default_priv
     if priv not in valid_privacy:
         priv = "PUBLIC_TO_EVERYONE"
 

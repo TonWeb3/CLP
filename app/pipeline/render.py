@@ -12,6 +12,29 @@ from . import media
 ASPECTS = {"9:16": (1080, 1920), "1:1": (1080, 1080), "4:5": (1080, 1350), "16:9": (1920, 1080)}
 
 EMOJI_KEYWORDS: dict[str, str] = {
+    # Faith, Preaching & Sermons
+    "god": "🙏", "jesus": "✝️", "christ": "✝️", "lord": "🙌", "faith": "🙏", "pray": "🙏",
+    "prayer": "🙏", "praying": "🙏", "amen": "🙌", "blessing": "✨", "blessed": "🙌", "bless": "✨",
+    "miracle": "✨", "miracles": "✨", "grace": "🕊️", "spirit": "🕊️", "holy": "🕊️", "bible": "📖",
+    "scripture": "📖", "church": "⛪", "heaven": "☁️", "angel": "👼", "angels": "👼", "cross": "✝️",
+    "worship": "🙌", "praise": "🙌", "glory": "✨", "sin": "⛓️", "forgive": "❤️‍🩹", "forgiveness": "❤️‍🩹",
+    "heal": "❤️‍🩹", "healing": "❤️‍🩹", "healed": "❤️‍🩹", "saved": "🛟", "salvation": "✝️", "hope": "🌅",
+    "peace": "🕊️", "soul": "✨", "purpose": "🧭", "calling": "📣", "destiny": "🌟", "light": "🕯️",
+    "darkness": "🌑", "enemy": "🛡️", "devil": "😈", "demon": "😈", "anointing": "🔥", "testimony": "🙌",
+    "breakthrough": "🔓", "chains": "⛓️", "free": "🕊️", "freedom": "🦅", "promise": "🌈", "victory": "🏆",
+    "mercy": "🤲", "gospel": "📖", "pastor": "🎙️", "preach": "🔥", "sermon": "📖",
+    # Podcasts, Storytelling, Relationships & Life
+    "podcast": "🎙️", "story": "📖", "question": "❓", "answer": "💡", "family": "👨‍👩‍👧‍👦", "marriage": "💍",
+    "husband": "🤵", "wife": "👰", "friend": "🤝", "friends": "🤝", "people": "👥", "world": "🌍",
+    "life": "🌱", "death": "💀", "dead": "💀", "fear": "😨", "afraid": "😨", "scared": "😱",
+    "pain": "💔", "broken": "💔", "hurt": "💔", "cry": "😢", "tears": "😢", "happy": "😊",
+    "joy": "🥳", "laugh": "😂", "funny": "😂", "angry": "😡", "strong": "💪", "strength": "💪",
+    "weak": "🥀", "work": "💼", "job": "💼", "career": "🚀", "business": "💼", "king": "👑",
+    "queen": "👑", "leader": "👑", "dream": "💭", "dreams": "✨", "vision": "🔭", "future": "🔮",
+    "past": "⏪", "today": "📅", "morning": "🌅", "night": "🌙", "sleep": "😴", "wake": "⏰",
+    "voice": "🗣️", "speak": "🗣️", "talk": "💬", "book": "📕", "read": "📖", "music": "🎵",
+    "health": "🩺", "body": "💪", "water": "💧", "home": "🏠", "house": "🏠", "door": "🚪",
+    "mountain": "⛰️", "storm": "⛈️", "rain": "🌧️",
     # Money & Wealth
     "money": "💰", "dollar": "💵", "dollars": "💵", "cash": "💸", "rich": "🤑", "million": "💰",
     "billion": "💰", "wealth": "💎", "crypto": "🪙", "profit": "📈", "revenue": "📈", "cost": "💳",
@@ -73,10 +96,78 @@ def _clean(text: str) -> str:
     return text.replace("\\", "").replace("{", "(").replace("}", ")").replace("\n", " ")
 
 
+def compute_speech_segments(
+    words: list[dict],
+    clip_start: float,
+    clip_end: float,
+    max_pause: float = 0.65,
+    pad: float = 0.16,
+) -> tuple[list[tuple[float, float]], list[dict], float]:
+    """Build synchronized (start, end) speech intervals relative to clip_start,
+    remap word timestamps onto the trimmed timeline, and return (segs, remapped_words, trimmed_dur).
+    """
+    dur = max(0.01, clip_end - clip_start)
+    ws = [dict(w) for w in words if w["e"] > clip_start and w["s"] < clip_end]
+    for w in ws:
+        w["_s"] = max(0.0, float(w["s"]) - clip_start)
+        w["_e"] = min(dur, float(w["e"]) - clip_start)
+
+    if not ws:
+        return [(0.0, dur)], ws, dur
+
+    raw_segs: list[list[float]] = []
+    for w in ws:
+        s = max(0.0, w["_s"] - pad)
+        e = min(dur, w["_e"] + pad)
+        if not raw_segs:
+            raw_segs.append([s, e])
+        else:
+            prev_s, prev_e = raw_segs[-1]
+            if s - prev_e <= max(0.05, max_pause - 2 * pad):
+                raw_segs[-1][1] = max(prev_e, e)
+            else:
+                raw_segs.append([s, e])
+
+    if raw_segs[0][0] < 0.4:
+        raw_segs[0][0] = 0.0
+    if dur - raw_segs[-1][1] < 0.4:
+        raw_segs[-1][1] = dur
+
+    while len(raw_segs) > 28:
+        best_i = min(range(len(raw_segs) - 1), key=lambda i: raw_segs[i + 1][0] - raw_segs[i][1])
+        raw_segs[best_i][1] = raw_segs[best_i + 1][1]
+        raw_segs.pop(best_i + 1)
+
+    segs = [(round(s, 3), round(e, 3)) for s, e in raw_segs if e - s > 0.05]
+    if not segs or (len(segs) == 1 and segs[0][0] <= 0.05 and dur - segs[0][1] <= 0.05):
+        return [(0.0, dur)], ws, dur
+
+    offsets: list[float] = []
+    acc = 0.0
+    for s, e in segs:
+        offsets.append(acc)
+        acc += e - s
+    trimmed_dur = max(0.5, round(acc, 3))
+
+    def remap_t(t: float) -> float:
+        for idx, (s, e) in enumerate(segs):
+            if t <= e or idx == len(segs) - 1:
+                clamped = max(s, min(e, t))
+                return round(offsets[idx] + (clamped - s), 3)
+        return trimmed_dur
+
+    for w in ws:
+        w["_s"] = remap_t(w["_s"])
+        w["_e"] = max(w["_s"] + 0.04, remap_t(w["_e"]))
+
+    return segs, ws, trimmed_dur
+
+
 def build_ass(words: list[dict], clip_start: float, clip_end: float, W: int, H: int, cfg: dict,
-              headline: str | None = None, opts: dict | None = None) -> str:
+              headline: str | None = None, opts: dict | None = None,
+              precomputed_ws: list[dict] | None = None, effective_dur: float | None = None) -> str:
     opts = opts or {}
-    dur = clip_end - clip_start
+    dur = effective_dur if effective_dur is not None else (clip_end - clip_start)
     preset = (opts.get("caption_preset") or cfg.get("caption_preset") or "classic").lower()
     enable_emojis = bool(opts.get("caption_emojis", cfg.get("caption_emojis", True)))
 
@@ -160,10 +251,13 @@ def build_ass(words: list[dict], clip_start: float, clip_end: float, W: int, H: 
             clean_hl = " ".join(words_hl[:split_idx]) + "\\N" + " ".join(words_hl[split_idx:])
         events.append(f"Dialogue: 1,0:00:00.00,{_ass_time(dur)},Banner,,0,0,0,,{clean_hl}")
 
-    ws = [w for w in words if w["e"] > clip_start and w["s"] < clip_end]
-    for w in ws:
-        w["_s"] = max(0.0, w["s"] - clip_start)
-        w["_e"] = min(dur, w["e"] - clip_start)
+    if precomputed_ws is not None:
+        ws = precomputed_ws
+    else:
+        ws = [w for w in words if w["e"] > clip_start and w["s"] < clip_end]
+        for w in ws:
+            w["_s"] = max(0.0, w["s"] - clip_start)
+            w["_e"] = min(dur, w["e"] - clip_start)
 
     # group into short lines
     groups: list[list[dict]] = []
@@ -420,7 +514,8 @@ def _subs_filter(has_subs: bool, in_label: str, out_label: str) -> str:
 
 def build_graph(mode: str, aspect: str, src_w: int, src_h: int, tw: int, th: int,
                 path: list[tuple[float, float]] | None, crop_w: int, has_subs: bool,
-                split_paths: tuple | None = None, dynamic_zoom: bool = True) -> str:
+                split_paths: tuple | None = None, dynamic_zoom: bool = True,
+                keep_segs: list[tuple[float, float]] | None = None) -> str:
     """Return a -filter_complex graph taking [0:v] and producing [v]."""
     if aspect == "16:9":
         base = (f"[0:v]scale={tw}:{th}:force_original_aspect_ratio=decrease,"
@@ -459,16 +554,23 @@ def build_graph(mode: str, aspect: str, src_w: int, src_h: int, tw: int, th: int
             x = f"{(src_w - cw) / 2:.1f}"
         base = f"[0:v]crop={cw}:{ch}:x='{x}':y=0,scale={tw}:{th}:flags=lanczos,setsar=1[v_raw]"
 
-    # Retention punch-in zoom during first 2.4 seconds
+    # Synchronized dead-air silence removal (applied after face-tracking crop so crop uses original t)
+    if keep_segs and len(keep_segs) >= 1:
+        sel_expr = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in keep_segs)
+        trim_filter = f";[v_raw]select='{sel_expr}',setpts=N/FRAME_RATE/TB[v_trim]"
+    else:
+        trim_filter = ";[v_raw]null[v_trim]"
+
+    # Retention punch-in zoom during first 2.2 seconds
     if dynamic_zoom and aspect in ("9:16", "4:5", "1:1"):
         zoom_filter = (
-            f";[v_raw]scale=eval=frame:w='if(lt(t,2.2),{tw}*(1+0.07*(1-t/2.2)),{tw})':"
+            f";[v_trim]scale=eval=frame:w='if(lt(t,2.2),{tw}*(1+0.07*(1-t/2.2)),{tw})':"
             f"h='if(lt(t,2.2),{th}*(1+0.07*(1-t/2.2)),{th})',crop={tw}:{th}[v0]"
         )
     else:
-        zoom_filter = ";[v_raw]null[v0]"
+        zoom_filter = ";[v_trim]null[v0]"
 
-    return base + zoom_filter + ";" + _subs_filter(has_subs, "v0", "v")
+    return base + trim_filter + zoom_filter + ";" + _subs_filter(has_subs, "v0", "v")
 
 
 def _slug(text: str, n: int = 48) -> str:
@@ -521,6 +623,18 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
     headline_text = (clip.get("title") or "").strip() if (show_headline and aspect in ("9:16", "4:5")) else None
     has_caption_words = captions and any(w["e"] > start and w["s"] < end for w in words)
     has_subs = has_caption_words or bool(headline_text)
+
+    # Synchronized silence removal across video, audio, and captions
+    keep_segs: list[tuple[float, float]] | None = None
+    remapped_ws: list[dict] | None = None
+    effective_dur = dur
+    if remove_silence and words:
+        segs, r_ws, t_dur = compute_speech_segments(words, start, end)
+        if t_dur < dur - 0.15:
+            keep_segs = segs
+            remapped_ws = r_ws if captions else []
+            effective_dur = t_dur
+
     out_dir = config.clips_dir() / _slug(video.get("title") or f"video-{video['id']}", 40)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{clip['id']:04d}-{_slug(clip.get('title') or 'clip')}.mp4"
@@ -537,20 +651,25 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
         if has_subs:
             sub_words = [dict(w) for w in words] if captions else []
             (Path(td) / "subs.ass").write_text(
-                build_ass(sub_words, start, end, tw, th, cfg, headline=headline_text, opts=opts),
+                build_ass(
+                    sub_words, start, end, tw, th, cfg,
+                    headline=headline_text, opts=opts,
+                    precomputed_ws=remapped_ws, effective_dur=effective_dur,
+                ),
                 "utf-8",
             )
         graph = build_graph(mode, aspect, sw, sh, tw, th, path, crop_w, has_subs,
-                            split_paths=split_paths, dynamic_zoom=dynamic_zoom)
+                            split_paths=split_paths, dynamic_zoom=dynamic_zoom, keep_segs=keep_segs)
 
-        # Audio handling: denoising + broadcast standard loudnorm
+        # Audio handling: synchronized silence trim + denoising + broadcast standard loudnorm
         audio_args = []
         if info["has_audio"]:
             af_chain = []
+            if keep_segs:
+                sel_expr = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in keep_segs)
+                af_chain.extend([f"aselect='{sel_expr}'", "asetpts=N/SR/TB"])
             if clean_audio:
                 af_chain.extend(["highpass=f=75", "lowpass=f=12000", "afftdn=nf=-25dB"])
-            if remove_silence:
-                af_chain.append("silenceremove=stop_periods=-1:stop_duration=0.6:stop_threshold=-36dB")
             if norm_audio:
                 af_chain.append("loudnorm=I=-14:LRA=11:TP=-1.5")
 
@@ -573,7 +692,7 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
                 if line.startswith("out_time_ms="):
                     try:
                         sec = int(line.split("=")[1]) / 1_000_000
-                        progress_cb(0.1 + 0.88 * min(sec / dur, 1.0), "Rendering")
+                        progress_cb(0.1 + 0.88 * min(sec / effective_dur, 1.0), "Rendering")
                     except ValueError:
                         pass
             code = proc.wait()
@@ -584,7 +703,7 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
 
     tmp_out.replace(out_path)
     thumb = out_path.with_suffix(".jpg")
-    media.make_thumb(out_path, thumb, at=min(1.0, dur / 2), width=360)
+    media.make_thumb(out_path, thumb, at=min(1.0, effective_dur / 2), width=360)
     return {
         "path": str(out_path),
         "thumb": str(thumb) if thumb.exists() else None,

@@ -122,8 +122,8 @@ function HomePage() {
     h("p", { class: "sub" }, "Paste links or upload a file. ClipForge transcribes each video, finds the strongest moments, and lets you choose which ones to render."),
     banner,
     h("div", { class: "panel intake" }, ta,
-      h("div", { class: "row between", style: { marginTop: "12px" } },
-        h("label", { class: "row small muted" }, "Or upload a file", file), go)),
+      h("div", { class: "row between intake-bar", style: { marginTop: "12px" } },
+        h("label", { class: "row small muted file-lbl" }, "Or upload a file", file), go)),
     list);
 
   async function start() {
@@ -158,7 +158,7 @@ function HomePage() {
     }, active ? "Cancel" : "Remove");
     return h("a", { class: "vcard", href: `#/video/${v.id}` },
       v.has_thumb ? h("img", { class: "thumb", src: `/api/videos/${v.id}/thumb`, alt: "", loading: "lazy" }) : h("div", { class: "thumb" }),
-      h("div", {},
+      h("div", { style: { minWidth: 0 } },
         h("div", { class: "title" }, v.title || v.url),
         h("div", { class: "meta" }, chip(label, kind), v.duration ? h("span", { class: "small muted" }, fmtDur(v.duration)) : null,
           active ? bar(v.progress * 100, v.status === "queued") : null),
@@ -405,7 +405,7 @@ function VideoPage(id) {
     });
 
     root.replaceChildren(
-      h("div", { class: "row between" },
+      h("div", { class: "row between page-head" },
         h("div", {}, h("h1", {}, v.title || v.url), h("p", { class: "sub", style: { marginBottom: "16px" } }, `${fmtDur(v.duration)} long. Pick the clips you want, adjust their start and end if needed, then render.`)),
         h("a", { class: "btn", href: "#/" }, "All videos")),
       h("div", { class: "review" },
@@ -413,7 +413,7 @@ function VideoPage(id) {
           h("div", { class: "row", style: { marginTop: "12px" } },
             h("button", { class: "btn sm", onclick: addAtPlayhead }, "Add clip at playhead"),
             h("button", { class: "btn sm ghost", onclick: guard(async () => { if (confirm("Search again with your current settings? Suggestions you have not rendered will be replaced.")) { await api(`/videos/${id}/retry`, { method: "POST" }); load(); } }) }, "Find again"))),
-        h("div", {},
+        h("div", { style: { minWidth: 0 } },
           h("div", { class: "row between", style: { marginBottom: "12px" } },
             h("h2", {}, `${data.clips.length} suggested clip${data.clips.length === 1 ? "" : "s"}`),
             h("div", { class: "row" },
@@ -421,10 +421,10 @@ function VideoPage(id) {
               h("button", { class: "btn sm ghost", onclick: () => setAll(() => false) }, "Clear"))),
           list,
           h("div", { class: "renderbar stack" },
-            h("div", { class: "row between" },
-              h("div", { class: "row" }, aspect, reframe, preset),
+            h("div", { class: "row between renderbar-top" },
+              h("div", { class: "row renderbar-selects" }, aspect, reframe, preset),
               renderBtn),
-            h("div", { class: "row small muted", style: { gap: "16px" } },
+            h("div", { class: "row small muted renderbar-opts", style: { gap: "16px" } },
               h("label", { class: "row small", for: "caps" }, caps, "Captions"),
               h("label", { class: "row small", for: "emojis", title: "Add auto-emojis to viral keywords" }, emojis, "Emojis"),
               h("label", { class: "row small", for: "zoom", title: "Subtle retention zoom on opening hook" }, zoom, "Hook zoom"),
@@ -454,39 +454,119 @@ function LibraryPage() {
   const folder = h("code", {});
   const el = h("div", {},
     h("h1", {}, "Library"),
-    h("p", { class: "sub" }, "Your rendered clips. Download them or send them straight to YouTube."),
+    h("p", { class: "sub" }, "Your rendered clips. Download them or send them straight to your named YouTube and TikTok accounts."),
     h("div", { class: "panel row between", style: { marginBottom: "18px" } },
       h("div", {}, h("span", { class: "muted" }, "Saved on the server in "), folder),
       h("a", { class: "small", href: "#/settings" }, "Change folder")),
     grid);
   let sig = "", refs = new Map(), timer;
 
-  async function openUploadTikTok(c) {
-    let tt = { connected: false };
+  async function openUpload(c) {
+    let accs = [];
     let st = {};
-    try { tt = await api("/tiktok/status"); st = (await api("/settings")).settings; } catch (e) { toast(e.message, true); return; }
-    if (!tt.connected) {
-      const close = modal(h("div", { class: "stack" }, h("h2", {}, "Connect TikTok first"),
-        h("p", { class: "muted" }, "Add your TikTok Client Key and Client Secret in Settings. After that you can post with one click."),
+    try {
+      const r = await api("/accounts");
+      accs = (r.accounts || []).filter((a) => a.platform === "youtube" && a.connected);
+      st = (await api("/settings")).settings;
+    } catch (e) { toast(e.message, true); return; }
+    if (!accs.length) {
+      const close = modal(h("div", { class: "stack" }, h("h2", {}, "Connect a YouTube account first"),
+        h("p", { class: "muted" }, "Add and connect one or more named YouTube API accounts in Settings. After that you can upload with one click."),
         h("div", { class: "row end" }, h("button", { class: "btn", onclick: () => close() }, "Close"), h("a", { class: "btn primary", href: "#/settings", onclick: () => close() }, "Open settings"))));
       return;
     }
+    const chosen = new Set([accs[0].id]);
+    const accChecks = h("div", { class: "stack", style: { gap: "6px", marginTop: "4px" } },
+      accs.map((a) => {
+        const chk = h("input", { type: "checkbox", checked: chosen.has(a.id), onchange: () => {
+          if (chk.checked) chosen.add(a.id); else chosen.delete(a.id);
+        } });
+        return h("label", { class: "check" }, chk, h("span", {}, h("strong", {}, a.name), " ", chip("YouTube", "yt")));
+      }));
+
+    const title = h("input", { type: "text", value: c.title, maxLength: 100 });
+    const desc = h("textarea", { placeholder: "Optional description", value: c.hook || "" });
+    const tags = h("input", { type: "text", placeholder: "shorts, clips (comma-separated)" });
+    const priv = h("select", {}, [
+      ["private", "Private"],
+      ["unlisted", "Unlisted"],
+      ["public", "Public"]
+    ].map(([v, t]) => h("option", { value: v, selected: v === (accs[0].privacy || st.yt_privacy || "private") }, t)));
+    const shorts = h("input", { type: "checkbox", checked: accs[0].add_shorts_tag !== false });
+
+    const go = h("button", { class: "btn primary", onclick: guard(async () => {
+      if (!chosen.size) { toast("Select at least one YouTube account.", true); return; }
+      go.disabled = true;
+      try {
+        await api(`/clips/${c.id}/youtube`, {
+          method: "POST",
+          json: {
+            title: title.value,
+            description: desc.value,
+            tags: tags.value.split(",").map((s) => s.trim()).filter(Boolean),
+            privacy: priv.value,
+            add_shorts_tag: shorts.checked,
+            account_ids: Array.from(chosen),
+          }
+        });
+        close(); toast("YouTube upload started."); load();
+      } finally { go.disabled = false; }
+    }) }, "Upload to YouTube");
+
+    const close = modal(h("div", { class: "stack" }, h("h2", {}, "Upload to YouTube"),
+      h("div", { class: "field" }, h("span", { class: "lbl" }, "Select YouTube API Account(s)"), accChecks),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Title"), title),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Description"), desc),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Tags"), tags),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Visibility"), priv),
+      h("label", { class: "check" }, shorts, h("span", {}, "Add #Shorts tag automatically")),
+      h("div", { class: "row end" }, h("button", { class: "btn", onclick: () => close() }, "Cancel"), go)));
+  }
+
+  async function openUploadTikTok(c) {
+    let accs = [];
+    let st = {};
+    try {
+      const r = await api("/accounts");
+      accs = (r.accounts || []).filter((a) => a.platform === "tiktok" && a.connected);
+      st = (await api("/settings")).settings;
+    } catch (e) { toast(e.message, true); return; }
+    if (!accs.length) {
+      const close = modal(h("div", { class: "stack" }, h("h2", {}, "Connect a TikTok account first"),
+        h("p", { class: "muted" }, "Add and connect one or more named TikTok API accounts in Settings. After that you can post with one click."),
+        h("div", { class: "row end" }, h("button", { class: "btn", onclick: () => close() }, "Close"), h("a", { class: "btn primary", href: "#/settings", onclick: () => close() }, "Open settings"))));
+      return;
+    }
+    const chosen = new Set([accs[0].id]);
+    const accChecks = h("div", { class: "stack", style: { gap: "6px", marginTop: "4px" } },
+      accs.map((a) => {
+        const chk = h("input", { type: "checkbox", checked: chosen.has(a.id), onchange: () => {
+          if (chk.checked) chosen.add(a.id); else chosen.delete(a.id);
+        } });
+        return h("label", { class: "check" }, chk, h("span", {}, h("strong", {}, a.name), " ", chip("TikTok", "tt")));
+      }));
+
     const title = h("input", { type: "text", value: c.title, maxLength: 150 });
     const priv = h("select", {}, [
       ["PUBLIC_TO_EVERYONE", "Public to everyone"],
       ["MUTUAL_FOLLOW_FRIENDS", "Friends only"],
       ["SELF_ONLY", "Only me (Private)"]
-    ].map(([v, t]) => h("option", { value: v, selected: v === (st.tiktok_privacy || "PUBLIC_TO_EVERYONE") }, t)));
+    ].map(([v, t]) => h("option", { value: v, selected: v === (accs[0].privacy || st.tiktok_privacy || "PUBLIC_TO_EVERYONE") }, t)));
 
     const go = h("button", { class: "btn primary", onclick: guard(async () => {
+      if (!chosen.size) { toast("Select at least one TikTok account.", true); return; }
       go.disabled = true;
       try {
-        await api(`/clips/${c.id}/tiktok`, { method: "POST", json: { title: title.value, privacy: priv.value } });
+        await api(`/clips/${c.id}/tiktok`, {
+          method: "POST",
+          json: { title: title.value, privacy: priv.value, account_ids: Array.from(chosen) }
+        });
         close(); toast("TikTok upload started."); load();
       } finally { go.disabled = false; }
     }) }, "Upload to TikTok");
 
     const close = modal(h("div", { class: "stack" }, h("h2", {}, "Upload to TikTok"),
+      h("div", { class: "field" }, h("span", { class: "lbl" }, "Select TikTok API Account(s)"), accChecks),
       h("label", { class: "field" }, h("span", { class: "lbl" }, "Video Caption / Title"), title),
       h("label", { class: "field" }, h("span", { class: "lbl" }, "Who can watch this video"), priv),
       h("div", { class: "row end" }, h("button", { class: "btn", onclick: () => close() }, "Cancel"), go)));
@@ -537,9 +617,9 @@ function LibraryPage() {
 
   function card(c) {
     const wide = c.width > c.height;
-    const ytBox = h("div", { class: "small" });
+    const ytBox = h("div", { class: "small stack", style: { gap: "4px" } });
     const ytBar = bar(0);
-    const ttBox = h("div", { class: "small" });
+    const ttBox = h("div", { class: "small stack", style: { gap: "4px" } });
     const ttBar = bar(0);
 
     const upBtn = h("button", { class: "btn sm", onclick: () => openUpload(c) }, "YouTube");
@@ -549,17 +629,39 @@ function LibraryPage() {
 
     function upd(nc) {
       Object.assign(c, nc);
+      const uploads = Object.values(c.uploads || {});
+      const ytUploads = uploads.filter((u) => u.platform === "youtube");
+      const ttUploads = uploads.filter((u) => u.platform === "tiktok");
+
       ytBox.replaceChildren();
-      if (c.yt_status === "uploading") ytBox.append(chip("YouTube: " + Math.round(c.yt_progress * 100) + "%", "info"));
-      else if (c.yt_status === "done") ytBox.append(chip("YouTube", "ok"), " ", h("a", { href: `https://youtu.be/${c.yt_id}`, target: "_blank", rel: "noopener" }, "Watch"));
-      else if (c.yt_status === "failed") ytBox.append(chip("YouTube failed", "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, c.yt_error || ""));
+      if (ytUploads.length) {
+        for (const u of ytUploads) {
+          const nm = u.name || "YouTube";
+          if (u.status === "uploading") ytBox.append(h("div", {}, chip(`${nm}: ${Math.round((u.progress || 0) * 100)}%`, "info")));
+          else if (u.status === "done") ytBox.append(h("div", {}, chip(nm, "ok"), " ", u.id ? h("a", { href: `https://youtu.be/${u.id}`, target: "_blank", rel: "noopener" }, "Watch") : "Uploaded"));
+          else if (u.status === "failed") ytBox.append(h("div", {}, chip(`${nm} failed`, "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, u.error || "")));
+        }
+      } else {
+        if (c.yt_status === "uploading") ytBox.append(chip("YouTube: " + Math.round(c.yt_progress * 100) + "%", "info"));
+        else if (c.yt_status === "done") ytBox.append(chip("YouTube", "ok"), " ", h("a", { href: `https://youtu.be/${c.yt_id}`, target: "_blank", rel: "noopener" }, "Watch"));
+        else if (c.yt_status === "failed") ytBox.append(chip("YouTube failed", "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, c.yt_error || ""));
+      }
       ytBar.style.display = c.yt_status === "uploading" ? "" : "none";
       setBar(ytBar, (c.yt_progress || 0) * 100);
 
       ttBox.replaceChildren();
-      if (c.tiktok_status === "uploading") ttBox.append(chip("TikTok: " + Math.round(c.tiktok_progress * 100) + "%", "info"));
-      else if (c.tiktok_status === "done") ttBox.append(chip("TikTok", "ok"), " Published");
-      else if (c.tiktok_status === "failed") ttBox.append(chip("TikTok failed", "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, c.tiktok_error || ""));
+      if (ttUploads.length) {
+        for (const u of ttUploads) {
+          const nm = u.name || "TikTok";
+          if (u.status === "uploading") ttBox.append(h("div", {}, chip(`${nm}: ${Math.round((u.progress || 0) * 100)}%`, "info")));
+          else if (u.status === "done") ttBox.append(h("div", {}, chip(nm, "ok"), " Published"));
+          else if (u.status === "failed") ttBox.append(h("div", {}, chip(`${nm} failed`, "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, u.error || "")));
+        }
+      } else {
+        if (c.tiktok_status === "uploading") ttBox.append(chip("TikTok: " + Math.round(c.tiktok_progress * 100) + "%", "info"));
+        else if (c.tiktok_status === "done") ttBox.append(chip("TikTok", "ok"), " Published");
+        else if (c.tiktok_status === "failed") ttBox.append(chip("TikTok failed", "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, c.tiktok_error || ""));
+      }
       ttBar.style.display = c.tiktok_status === "uploading" ? "" : "none";
       setBar(ttBar, (c.tiktok_progress || 0) * 100);
 
@@ -591,7 +693,7 @@ function LibraryPage() {
     let r;
     try { r = await api("/clips?status=ready"); } catch { return; }
     folder.textContent = r.folder;
-    const s = r.clips.map((c) => `${c.id}:${c.yt_status || ""}:${c.tiktok_status || ""}`).join("|");
+    const s = r.clips.map((c) => `${c.id}:${c.yt_status || ""}:${c.tiktok_status || ""}:${JSON.stringify(c.uploads || {})}`).join("|");
     if (s !== sig) {
       sig = s; refs = new Map();
       grid.replaceChildren(...(r.clips.length ? r.clips.map(card) : [h("div", { class: "empty", style: { gridColumn: "1 / -1" } }, "Nothing here yet. Render clips from a video and they will appear here.")]));
@@ -608,23 +710,77 @@ function PublisherPage() {
   let timer;
 
   const openNewSchedule = guard(async (preselectedClipId = null) => {
-    const { clips } = await api("/clips?status=ready");
+    const [{ clips }, accRes] = await Promise.all([
+      api("/clips?status=ready"),
+      api("/accounts").catch(() => ({ accounts: [] })),
+    ]);
     if (!clips.length) {
       toast("No rendered clips in the library yet. Render clips first.", true);
       return;
     }
-    const [ytStatus, ttStatus] = await Promise.all([
-      api("/youtube/status").catch(() => ({ connected: false })),
-      api("/tiktok/status").catch(() => ({ connected: false })),
-    ]);
+    const accounts = accRes.accounts || [];
+    if (!accounts.length) {
+      const close = modal(h("div", { class: "stack" },
+        h("h2", {}, "Add a YouTube or TikTok API first"),
+        h("p", { class: "muted" }, "Go to Settings to add and name your YouTube and TikTok API accounts before scheduling automations."),
+        h("div", { class: "row end" },
+          h("button", { class: "btn", onclick: () => close() }, "Close"),
+          h("a", { class: "btn primary", href: "#/settings", onclick: () => close() }, "Open Settings"))));
+      return;
+    }
 
     const selectedClips = new Set(preselectedClipId ? [preselectedClipId] : [clips[0].id]);
+    const connectedIds = accounts.filter((a) => a.connected).map((a) => a.id);
+    const defaultAccounts = new Set(connectedIds.length ? connectedIds : [accounts[0].id]);
+    // Per-clip API map: clip_id -> Set(account_id)
+    const clipRouteMap = new Map();
+    for (const c of clips) {
+      clipRouteMap.set(c.id, new Set(defaultAccounts));
+    }
+
+    const routeContainer = h("div", { class: "route-box" });
+
+    function renderPerClipRouting() {
+      const pickedClips = clips.filter((c) => selectedClips.has(c.id));
+      if (!pickedClips.length) {
+        routeContainer.replaceChildren(h("div", { class: "small muted" }, "Select at least one clip above."));
+        return;
+      }
+      routeContainer.replaceChildren(...pickedClips.map((c) => {
+        const cSet = clipRouteMap.get(c.id) || new Set();
+        const pills = accounts.map((acc) => {
+          const isYoutube = acc.platform === "youtube";
+          const active = cSet.has(acc.id);
+          const pill = h("span", {
+            class: `api-pill ${isYoutube ? "yt" : "tt"}${active ? " active" : ""}`,
+            title: `${isYoutube ? "YouTube" : "TikTok"}: ${acc.name}${acc.connected ? "" : " (Not connected yet)"}`,
+            onclick: () => {
+              if (cSet.has(acc.id)) cSet.delete(acc.id);
+              else cSet.add(acc.id);
+              pill.classList.toggle("active", cSet.has(acc.id));
+              updateBtn();
+            }
+          }, h("span", { class: "dot" }), `${isYoutube ? "YT" : "TT"}: ${acc.name}`);
+          return pill;
+        });
+        return h("div", { class: "route-row" },
+          h("div", { class: "clip-name", title: c.title }, c.title),
+          h("div", { class: "api-pills" }, pills));
+      }));
+    }
+
     const clipGrid = h("div", { class: "clip-selector" },
       clips.map((c) => {
         const item = h("div", { class: "clip-pick-item" + (selectedClips.has(c.id) ? " selected" : ""), onclick: () => {
           if (selectedClips.has(c.id)) { if (selectedClips.size > 1) selectedClips.delete(c.id); }
-          else selectedClips.add(c.id);
+          else {
+            selectedClips.add(c.id);
+            if (!clipRouteMap.has(c.id) || !clipRouteMap.get(c.id).size) {
+              clipRouteMap.set(c.id, new Set(defaultAccounts));
+            }
+          }
           item.classList.toggle("selected", selectedClips.has(c.id));
+          renderPerClipRouting();
           updateBtn();
         } },
           c.has_thumb ? h("img", { src: `/api/clips/${c.id}/thumb`, alt: "" }) : h("div", { style: { height: "70px", background: "var(--line)" } }),
@@ -632,8 +788,34 @@ function PublisherPage() {
         return item;
       }));
 
-    const chkYT = h("input", { type: "checkbox", checked: ytStatus.connected });
-    const chkTT = h("input", { type: "checkbox", checked: ttStatus.connected });
+    // Step 2: Named API checkboxes (bulk toggle)
+    const defaultApiChecks = h("div", { class: "row", style: { marginTop: "6px", gap: "14px", flexWrap: "wrap" } },
+      accounts.map((acc) => {
+        const isYT = acc.platform === "youtube";
+        const chk = h("input", {
+          type: "checkbox",
+          checked: defaultAccounts.has(acc.id),
+          onchange: () => {
+            if (chk.checked) defaultAccounts.add(acc.id);
+            else defaultAccounts.delete(acc.id);
+            for (const cid of selectedClips) {
+              const s = clipRouteMap.get(cid) || new Set();
+              if (chk.checked) s.add(acc.id);
+              else s.delete(acc.id);
+              clipRouteMap.set(cid, s);
+            }
+            renderPerClipRouting();
+            updateBtn();
+          }
+        });
+        return h("label", { class: "check" },
+          chk,
+          h("span", {},
+            chip(isYT ? "YouTube" : "TikTok", isYT ? "yt" : "tt"),
+            " ",
+            h("strong", {}, acc.name),
+            !acc.connected ? h("span", { class: "small muted" }, " (Not connected)") : ""));
+      }));
 
     const modeSelect = h("select", {}, [
       ["time", "At a specific date and time"],
@@ -656,11 +838,18 @@ function PublisherPage() {
     });
 
     const submitBtn = h("button", { class: "btn primary", onclick: guard(async () => {
-      const platforms = [];
-      if (chkYT.checked) platforms.push("youtube");
-      if (chkTT.checked) platforms.push("tiktok");
-      if (!platforms.length) { toast("Select at least one destination platform (YouTube or TikTok).", true); return; }
       if (!selectedClips.size) { toast("Select at least one clip.", true); return; }
+      const clipAccountsPayload = {};
+      let anyTarget = false;
+      for (const cid of selectedClips) {
+        const arr = Array.from(clipRouteMap.get(cid) || []);
+        clipAccountsPayload[String(cid)] = arr;
+        if (arr.length) anyTarget = true;
+      }
+      if (!anyTarget) {
+        toast("Assign at least one named YouTube or TikTok API to your selected clip(s).", true);
+        return;
+      }
 
       const startTime = new Date(timeInput.value).getTime() / 1000;
       if (isNaN(startTime)) { toast("Choose a valid start date and time.", true); return; }
@@ -671,7 +860,8 @@ function PublisherPage() {
           method: "POST",
           json: {
             clip_ids: Array.from(selectedClips),
-            platforms,
+            account_ids: Array.from(defaultAccounts),
+            clip_accounts: clipAccountsPayload,
             mode: modeSelect.value,
             start_time: startTime,
             interval_minutes: Math.max(1, parseInt(intervalInput.value, 10) * 60),
@@ -685,21 +875,23 @@ function PublisherPage() {
     }) }, "Schedule uploads");
 
     function updateBtn() {
-      submitBtn.textContent = `Schedule ${selectedClips.size} upload${selectedClips.size > 1 ? "s" : ""}`;
+      submitBtn.textContent = `Schedule ${selectedClips.size} clip${selectedClips.size > 1 ? "s" : ""}`;
     }
+    renderPerClipRouting();
     updateBtn();
 
     const close = modal(h("div", { class: "stack" },
       h("h2", {}, "Queue automated uploads"),
-      h("p", { class: "hint", style: { margin: 0 } }, "Select one or more clips and choose when to automatically publish them."),
+      h("p", { class: "hint", style: { margin: 0 } }, "Select clips, choose which named YouTube / TikTok APIs each clip goes to, and set your schedule."),
       h("div", {}, h("span", { class: "lbl", style: { fontWeight: 650 } }, "1. Select clips to publish:"), clipGrid),
       h("div", {},
-        h("span", { class: "lbl", style: { fontWeight: 650 } }, "2. Destinations:"),
-        h("div", { class: "row", style: { marginTop: "6px", gap: "20px" } },
-          h("label", { class: "check" }, chkYT, h("span", {}, "YouTube Shorts", !ytStatus.connected ? " (Not connected)" : "")),
-          h("label", { class: "check" }, chkTT, h("span", {}, "TikTok", !ttStatus.connected ? " (Not connected)" : "")))),
+        h("span", { class: "lbl", style: { fontWeight: 650 } }, "2. Available Named APIs (apply to all selected):"),
+        defaultApiChecks),
       h("div", {},
-        h("span", { class: "lbl", style: { fontWeight: 650 } }, "3. Schedule timing:"),
+        h("span", { class: "lbl", style: { fontWeight: 650 } }, "3. Per-clip API routing (click pills to customize which clip goes to which API):"),
+        routeContainer),
+      h("div", {},
+        h("span", { class: "lbl", style: { fontWeight: 650 } }, "4. Schedule timing:"),
         h("div", { style: { marginTop: "6px" } }, modeSelect),
         timeWrap, intervalWrap),
       h("div", { class: "row end", style: { marginTop: "14px" } },
@@ -709,32 +901,40 @@ function PublisherPage() {
 
   function schedCard(item) {
     const plats = item.platforms || [];
+    const accDetails = item.account_details || [];
     const dateStr = new Date(item.scheduled_time * 1000).toLocaleString();
     const isPast = item.scheduled_time * 1000 <= Date.now();
     const st = item.status;
 
-    const platChips = plats.map((p) => chip(p === "youtube" ? "YouTube" : "TikTok", p === "youtube" ? "yt" : "tt"));
+    const targetChips = accDetails.length
+      ? accDetails.map((a) => chip(`${a.platform === "youtube" ? "YT" : "TT"}: ${a.name}`, a.platform === "youtube" ? "yt" : "tt"))
+      : plats.map((p) => chip(p === "youtube" ? "YouTube" : "TikTok", p === "youtube" ? "yt" : "tt"));
+
     const statusChip = st === "pending" ? chip(isPast ? "Triggering..." : dateStr, "info")
       : st === "uploading" ? chip("Uploading now...", "warn")
       : st === "completed" ? chip("Published", "ok")
+      : st === "partial" ? chip("Partially published", "warn")
       : chip("Failed", "err");
 
     const res = item.results || {};
     const links = [];
-    if (res.youtube && res.youtube.id) {
-      links.push(h("a", { class: "small", href: `https://youtu.be/${res.youtube.id}`, target: "_blank", rel: "noopener" }, "Open on YouTube"));
-    }
-    if (res.tiktok && res.tiktok.id) {
-      links.push(h("span", { class: "small muted" }, "TikTok ID: " + res.tiktok.id));
+    for (const [k, r] of Object.entries(res)) {
+      if (!r || !r.ok) continue;
+      const label = r.name || (k === "youtube" ? "YouTube" : k === "tiktok" ? "TikTok" : k);
+      if ((r.platform === "youtube" || k === "youtube") && r.id) {
+        links.push(h("a", { class: "small", href: `https://youtu.be/${r.id}`, target: "_blank", rel: "noopener" }, `Watch (${label})`));
+      } else if ((r.platform === "tiktok" || k === "tiktok") && r.id) {
+        links.push(h("span", { class: "small muted" }, `${label} published`));
+      }
     }
 
     const cancelBtn = h("button", { class: "btn sm ghost danger", onclick: guard(async () => {
       if (!confirm("Remove this scheduled upload?")) return;
       await api(`/scheduled/${item.id}`, { method: "DELETE" });
       load();
-    }) }, st === "completed" || st === "failed" ? "Remove" : "Cancel");
+    }) }, st === "completed" || st === "failed" || st === "partial" ? "Remove" : "Cancel");
 
-    const retryBtn = st === "failed" ? h("button", { class: "btn sm", onclick: guard(async () => {
+    const retryBtn = (st === "failed" || st === "partial") ? h("button", { class: "btn sm", onclick: guard(async () => {
       await api(`/scheduled/${item.id}/retry`, { method: "POST" });
       toast("Queued for immediate retry.");
       load();
@@ -742,18 +942,18 @@ function PublisherPage() {
 
     return h("div", { class: "sched-card" },
       item.has_thumb ? h("img", { class: "thumb", src: `/api/clips/${item.clip_id}/thumb`, alt: "" }) : h("div", { class: "thumb" }),
-      h("div", {},
+      h("div", { style: { minWidth: 0 } },
         h("div", { style: { fontWeight: 700 } }, item.clip_title || "Untitled clip"),
-        h("div", { class: "meta" }, statusChip, ...platChips, ...links),
+        h("div", { class: "meta" }, statusChip, ...targetChips, ...links),
         item.error ? h("div", { class: "small", style: { color: "var(--err)", marginTop: "4px" } }, item.error) : null),
-      h("div", { class: "row" }, retryBtn, cancelBtn));
+      h("div", { class: "row sched-actions" }, retryBtn, cancelBtn));
   }
 
   async function load() {
     try {
       const { scheduled } = await api("/scheduled");
       list.replaceChildren(...(scheduled.length ? scheduled.map(schedCard)
-        : [h("div", { class: "empty" }, "No scheduled uploads yet. Click '+ Schedule upload' to automate your posting!")]));
+        : [h("div", { class: "empty" }, "No scheduled uploads yet. Click '+ Schedule uploads' to automate your posting!")]));
     } catch (e) { /* ignore */ }
   }
 
@@ -767,10 +967,10 @@ function PublisherPage() {
   }
 
   const el = h("div", {},
-    h("div", { class: "row between", style: { marginBottom: "16px" } },
+    h("div", { class: "row between page-head", style: { marginBottom: "16px" } },
       h("div", {},
         h("h1", {}, "Publisher & Scheduler"),
-        h("p", { class: "sub", style: { margin: 0 } }, "Automate and space out your video uploads to YouTube Shorts and TikTok.")),
+        h("p", { class: "sub", style: { margin: 0 } }, "Automate and route your clips to specific named YouTube Shorts and TikTok API accounts.")),
       h("button", { class: "btn primary", onclick: () => openNewSchedule() }, "+ Schedule uploads")),
     list);
 
@@ -986,7 +1186,7 @@ const SCHEMA = [
     { key: "aspect", label: "Default shape", type: "select", options: [["9:16", "Vertical 9:16"], ["1:1", "Square 1:1"], ["4:5", "Portrait 4:5"], ["16:9", "Wide 16:9"]] },
     { key: "reframe", label: "Default framing", type: "select", options: [["face", "Follow the speaker"], ["split", "Stacked split-screen (2 speakers)"], ["center", "Center crop"], ["blur", "Fit with blurred background"]] },
     { key: "captions", label: "Burn in captions by default", type: "bool" },
-    { key: "caption_preset", label: "Subtitle style preset", type: "select", options: [["classic", "Classic Clean"], ["hormozi", "Hormozi (Bold & Green)"], ["mrbeast", "MrBeast (High Contrast Punchy)"], ["minimal", "Minimalist (Sleek Understated)"]] },
+    { key: "caption_preset", label: "Subtitle style preset", type: "select", options: [["classic", "Classic Clean"], ["hormozi", "Hormozi (Bold & Green)"], ["mrbeast", "MrBeast (High Contrast Punchy)"], ["minimalist", "Minimalist (Sleek Understated)"]] },
     { key: "caption_emojis", label: "Auto keyword emojis", type: "bool", hint: "Automatically detects viral/emotional keywords and places animated-style emojis." },
     { key: "dynamic_zoom", label: "Dynamic punch-in retention zooms", type: "bool", hint: "Engaging 1.12x punch-in camera zooms on key speech moments for higher retention." },
     { key: "clean_audio", label: "Audio denoise & speech cleanup", type: "bool", hint: "Removes background hum and room noise with highpass/lowpass + spectral denoising." },
@@ -1017,8 +1217,9 @@ const SCHEMA = [
 ];
 
 function SettingsPage(params) {
-  let settings = {}, yt = {}, tiktok = {};
+  let settings = {}, accounts = [], redirectUris = {};
   const inputs = {};
+  const accInputs = new Map(); // acc.id -> { name, client_id, client_secret, privacy, add_shorts_tag }
   const root = h("div");
   const preview = h("div", { class: "cap-preview" });
 
@@ -1031,20 +1232,134 @@ function SettingsPage(params) {
   const current = () => { const s = { ...settings }; for (const f of allFields()) if (inputs[f.key] && !f.type.startsWith("secret")) s[f.key] = readValue(f); return s; };
   const allFields = () => SCHEMA.flatMap((s) => s.fields);
 
+  async function saveAccountCard(accId, silent = false) {
+    const ref = accInputs.get(accId);
+    if (!ref) return;
+    const patch = {
+      name: ref.name.value.trim(),
+      client_id: ref.client_id.value.trim(),
+      privacy: ref.privacy.value,
+    };
+    if (ref.client_secret.value) patch.client_secret = ref.client_secret.value.trim();
+    if (ref.add_shorts_tag) patch.add_shorts_tag = ref.add_shorts_tag.checked;
+    await api(`/accounts/${accId}`, { method: "PATCH", json: patch });
+    if (!silent) toast(`Saved "${patch.name}".`);
+  }
+
   async function save(silent = false) {
     const body = {};
     for (const f of allFields()) {
       const i = inputs[f.key]; if (!i) continue;
       if (f.type.startsWith("secret")) { if (i.value) body[f.key] = i.value; } else body[f.key] = readValue(f);
     }
-    for (const k of ["yt_client_id", "yt_privacy", "tiktok_client_key", "tiktok_privacy"]) if (inputs[k]) body[k] = inputs[k].value;
-    if (inputs.yt_client_secret && inputs.yt_client_secret.value) body.yt_client_secret = inputs.yt_client_secret.value;
-    if (inputs.tiktok_client_secret && inputs.tiktok_client_secret.value) body.tiktok_client_secret = inputs.tiktok_client_secret.value;
-    if (inputs.yt_add_shorts_tag) body.yt_add_shorts_tag = inputs.yt_add_shorts_tag.checked;
     const r = await api("/settings", { method: "POST", json: body });
     settings = r.settings;
-    if (!silent) toast("Settings saved.");
+    for (const accId of accInputs.keys()) {
+      await saveAccountCard(accId, true);
+    }
+    if (!silent) {
+      toast("Settings saved.");
+      await load();
+    }
     return r;
+  }
+
+  function openAddAccountModal(platform) {
+    const isYT = platform === "youtube";
+    const count = accounts.filter((a) => a.platform === platform).length + 1;
+    const nameIn = h("input", { type: "text", value: `${isYT ? "YouTube" : "TikTok"} Account #${count}`, placeholder: isYT ? "e.g. Main YouTube, Shorts Channel 2" : "e.g. Main TikTok, Clips TikTok 2" });
+    const idIn = h("input", { type: "text", placeholder: isYT ? "Google OAuth Client ID" : "TikTok Client Key" });
+    const secIn = h("input", { type: "password", autocomplete: "off", placeholder: isYT ? "Google OAuth Client Secret" : "TikTok Client Secret" });
+    const privIn = h("select", {}, (isYT
+      ? [["private", "Private"], ["unlisted", "Unlisted"], ["public", "Public"]]
+      : [["PUBLIC_TO_EVERYONE", "Public to everyone"], ["MUTUAL_FOLLOW_FRIENDS", "Friends only"], ["SELF_ONLY", "Only me (Private)"]]
+    ).map(([v, l]) => h("option", { value: v }, l)));
+    const shortsIn = h("input", { type: "checkbox", checked: true });
+
+    const createBtn = h("button", { class: "btn primary", onclick: guard(async () => {
+      if (!nameIn.value.trim()) { toast("Enter a name for this API account.", true); return; }
+      createBtn.disabled = true;
+      try {
+        await api("/accounts", {
+          method: "POST",
+          json: {
+            platform,
+            name: nameIn.value.trim(),
+            client_id: idIn.value.trim(),
+            client_secret: secIn.value.trim(),
+            privacy: privIn.value,
+            add_shorts_tag: isYT ? shortsIn.checked : false,
+          }
+        });
+        close();
+        toast(`Added "${nameIn.value.trim()}".`);
+        await load();
+      } finally { createBtn.disabled = false; }
+    }) }, `Add ${isYT ? "YouTube" : "TikTok"} API`);
+
+    const close = modal(h("div", { class: "stack" },
+      h("h2", {}, `Add ${isYT ? "YouTube" : "TikTok"} API Account`),
+      h("p", { class: "hint", style: { margin: 0 } }, "Give this API connection a clear name so you can select it in the Library and Publisher automations."),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Account / API Name"), nameIn),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, isYT ? "Google OAuth Client ID" : "TikTok Client Key"), idIn),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, isYT ? "Google OAuth Client Secret" : "TikTok Client Secret"), secIn),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Default visibility / privacy"), privIn),
+      isYT ? h("label", { class: "check" }, shortsIn, h("span", { style: { fontWeight: 650 } }, "Add #Shorts to vertical clips")) : null,
+      h("div", { class: "row end", style: { marginTop: "8px" } },
+        h("button", { class: "btn", onclick: () => close() }, "Cancel"),
+        createBtn)));
+  }
+
+  function renderAccountCard(acc) {
+    const isYT = acc.platform === "youtube";
+    const nameIn = h("input", { type: "text", value: acc.name, placeholder: "Account name" });
+    const idIn = h("input", { type: "text", value: acc.client_id || "" });
+    const secIn = h("input", { type: "password", autocomplete: "off", placeholder: acc.client_secret_set ? "Saved. Type to replace." : "Not set" });
+    const privIn = h("select", {}, (isYT
+      ? [["private", "Private"], ["unlisted", "Unlisted"], ["public", "Public"]]
+      : [["PUBLIC_TO_EVERYONE", "Public to everyone"], ["MUTUAL_FOLLOW_FRIENDS", "Friends only"], ["SELF_ONLY", "Only me (Private)"]]
+    ).map(([v, l]) => h("option", { value: v, selected: acc.privacy === v }, l)));
+    const shortsIn = isYT ? h("input", { type: "checkbox", checked: !!acc.add_shorts_tag }) : null;
+
+    accInputs.set(acc.id, { name: nameIn, client_id: idIn, client_secret: secIn, privacy: privIn, add_shorts_tag: shortsIn });
+
+    const connectBtn = h("button", { class: "btn sm primary", onclick: guard(async () => {
+      await saveAccountCard(acc.id, true);
+      const r = await api(`/accounts/${acc.id}/connect`);
+      location.href = r.url;
+    }) }, acc.connected ? "Reconnect" : `Connect ${isYT ? "YouTube" : "TikTok"}`);
+
+    const saveBtn = h("button", { class: "btn sm", onclick: guard(async () => {
+      await saveAccountCard(acc.id, false);
+      await load();
+    }) }, "Save");
+
+    const disBtn = acc.connected ? h("button", { class: "btn sm", onclick: guard(async () => {
+      await api(`/accounts/${acc.id}/disconnect`, { method: "POST" });
+      toast(`Disconnected "${acc.name}".`);
+      await load();
+    }) }, "Disconnect") : null;
+
+    const delBtn = h("button", { class: "btn sm ghost danger", onclick: guard(async () => {
+      if (!confirm(`Remove "${acc.name}"?`)) return;
+      await api(`/accounts/${acc.id}`, { method: "DELETE" });
+      toast(`Removed "${acc.name}".`);
+      await load();
+    }) }, "Remove");
+
+    return h("div", { class: "acc-card" },
+      h("div", { class: "acc-card-head" },
+        h("div", { class: "row" },
+          chip(isYT ? "YouTube" : "TikTok", isYT ? "yt" : "tt"),
+          h("strong", {}, acc.name),
+          acc.connected ? chip("Connected", "ok") : chip("Not connected", "warn")),
+        h("div", { class: "row" }, connectBtn, saveBtn, disBtn, delBtn)),
+      h("div", { class: "fields" },
+        h("label", { class: "field" }, h("span", { class: "lbl" }, "Account / API Name"), nameIn),
+        h("label", { class: "field" }, h("span", { class: "lbl" }, isYT ? "Google OAuth Client ID" : "TikTok Client Key"), idIn),
+        h("label", { class: "field" }, h("span", { class: "lbl" }, isYT ? "Google OAuth Client Secret" : "TikTok Client Secret"), secIn),
+        h("label", { class: "field" }, h("span", { class: "lbl" }, "Default visibility"), privIn),
+        isYT ? h("label", { class: "check", style: { alignSelf: "center", marginTop: "18px" } }, shortsIn, h("span", { style: { fontWeight: 650 } }, "Add #Shorts to vertical clips")) : null));
   }
 
   function field(f) {
@@ -1095,74 +1410,70 @@ function SettingsPage(params) {
   }
 
   function ytPanel() {
-    const dis = h("button", { class: "btn", onclick: guard(async () => { await api("/youtube/disconnect", { method: "POST" }); toast("Disconnected from YouTube."); load(); }) }, "Disconnect");
-    const connect = h("button", { class: "btn primary", onclick: guard(async () => {
-      await save(true);
-      const r = await api("/youtube/connect"); location.href = r.url;
-    }) }, yt.connected ? "Reconnect" : "Connect YouTube");
-    const idF = { key: "yt_client_id", label: "Google OAuth client ID", type: "text" };
-    const secF = { key: "yt_client_secret", label: "Google OAuth client secret", type: "secret" };
+    const ytAccs = accounts.filter((a) => a.platform === "youtube");
+    const redUri = redirectUris.youtube || (location.origin + "/api/youtube/callback");
     return h("section", { class: "panel" },
-      h("header", {}, h("h2", {}, "YouTube upload"), h("p", { class: "hint", style: { margin: 0 } }, "Lets you upload rendered clips from the Library. You need your own free Google OAuth keys.")),
-      h("div", { class: "row", style: { marginBottom: "12px" } }, yt.connected ? chip("Connected", "ok") : chip("Not connected", "warn"), yt.connected ? dis : null),
-      h("div", { class: "fields" }, field(idF), field(secF),
-        h("label", { class: "field" }, h("span", { class: "lbl" }, "Default visibility"), (inputs.yt_privacy = h("select", {}, ["private", "unlisted", "public"].map((p) => h("option", { value: p, selected: settings.yt_privacy === p }, p[0].toUpperCase() + p.slice(1)))))),
-        h("label", { class: "check" }, (inputs.yt_add_shorts_tag = h("input", { type: "checkbox", checked: !!settings.yt_add_shorts_tag })), h("span", { style: { fontWeight: 650 } }, "Add #Shorts to vertical clips"))),
-      h("div", { style: { margin: "16px 0 12px" } }, connect),
+      h("header", { class: "stack", style: { gap: "10px", alignItems: "flex-start" } },
+        h("div", {},
+          h("h2", {}, `YouTube Accounts & APIs (${ytAccs.length})`),
+          h("p", { class: "hint", style: { margin: 0 } }, "Connect one or multiple named YouTube channels/APIs. In Publisher, you can choose which clip goes to which named YouTube API.")),
+        h("button", { class: "btn sm primary", onclick: () => openAddAccountModal("youtube") }, "+ Add YouTube Account / API")),
+      ytAccs.length
+        ? h("div", { class: "acc-list" }, ytAccs.map(renderAccountCard))
+        : h("div", { class: "empty", style: { margin: "12px 0", padding: "18px" } }, "No YouTube API accounts added yet. Click '+ Add YouTube Account / API' to add your first channel."),
+      h("div", { style: { marginBottom: "12px" } },
+        h("button", { class: "btn sm", onclick: () => openAddAccountModal("youtube") }, "+ Add Another YouTube Account / API")),
       h("details", {},
-        h("summary", { style: { cursor: "pointer", fontWeight: 650 } }, "How to get the keys"),
+        h("summary", { style: { cursor: "pointer", fontWeight: 650 } }, "How to get Google OAuth keys"),
         h("ol", { class: "small" },
           h("li", {}, "In Google Cloud Console, create a project and enable ", h("strong", {}, "YouTube Data API v3"), "."),
-          h("li", {}, "Open the OAuth consent screen, choose External, and add your own Google account as a test user."),
+          h("li", {}, "Open the OAuth consent screen, choose External, and add your Google account(s) as test users."),
           h("li", {}, "Create an OAuth client ID of type ", h("strong", {}, "Web application"), ". Under authorized redirect URIs add exactly:"),
-          h("li", { style: { listStyle: "none" } }, h("div", { class: "row" }, h("code", {}, yt.redirect_uri || ""), h("button", { class: "btn sm", onclick: () => { navigator.clipboard && navigator.clipboard.writeText(yt.redirect_uri); toast("Copied."); } }, "Copy"))),
-          h("li", {}, "Paste the client ID and secret above, press Connect YouTube, and approve access.")),
-        h("p", { class: "small muted" }, "Google only accepts a plain http redirect for localhost. If ClipForge runs on a remote server, open it through an SSH tunnel (ssh -L 8000:localhost:8000 you@server) and use http://localhost:8000."),
-        h("p", { class: "small muted" }, "While your Google app is in Testing mode, sign-in expires after 7 days and you will need to reconnect. YouTube also keeps uploads from unverified API projects private until the project passes Google's audit. Each upload uses 1,600 of the default 10,000 daily quota units, so about 6 uploads per day.")));
+          h("li", { style: { listStyle: "none" } }, h("div", { class: "row" }, h("code", {}, redUri), h("button", { class: "btn sm", onclick: () => { navigator.clipboard && navigator.clipboard.writeText(redUri); toast("Copied."); } }, "Copy"))),
+          h("li", {}, "Add a YouTube API above, paste the Client ID and Secret, and press Connect YouTube.")),
+        h("p", { class: "small muted" }, "Tip: Every Google Cloud project gets its own 10,000 daily quota units (~6 uploads/day). Adding multiple projects/accounts lets you scale your daily uploads and route clips to different channels.")));
   }
 
   function tiktokPanel() {
-    const dis = h("button", { class: "btn", onclick: guard(async () => { await api("/tiktok/disconnect", { method: "POST" }); toast("Disconnected from TikTok."); load(); }) }, "Disconnect");
-    const connect = h("button", { class: "btn primary", onclick: guard(async () => {
-      await save(true);
-      const r = await api("/tiktok/connect"); location.href = r.url;
-    }) }, tiktok.connected ? "Reconnect" : "Connect TikTok");
-    const keyF = { key: "tiktok_client_key", label: "TikTok Client Key", type: "text" };
-    const secF = { key: "tiktok_client_secret", label: "TikTok Client Secret", type: "secret" };
+    const ttAccs = accounts.filter((a) => a.platform === "tiktok");
+    const redUri = redirectUris.tiktok || (location.origin + "/api/tiktok/callback");
     return h("section", { class: "panel" },
-      h("header", {}, h("h2", {}, "TikTok upload"), h("p", { class: "hint", style: { margin: 0 } }, "Direct automatic publishing via TikTok Content Posting API v2.")),
-      h("div", { class: "row", style: { marginBottom: "12px" } }, tiktok.connected ? chip("Connected", "ok") : chip("Not connected", "warn"), tiktok.connected ? dis : null),
-      h("div", { class: "fields" }, field(keyF), field(secF),
-        h("label", { class: "field" }, h("span", { class: "lbl" }, "Default privacy level"), (inputs.tiktok_privacy = h("select", {}, [
-          ["PUBLIC_TO_EVERYONE", "Public to everyone"],
-          ["MUTUAL_FOLLOW_FRIENDS", "Friends only"],
-          ["SELF_ONLY", "Only me (Private)"]
-        ].map(([v, l]) => h("option", { value: v, selected: (settings.tiktok_privacy || "PUBLIC_TO_EVERYONE") === v }, l)))))),
-      h("div", { style: { margin: "16px 0 12px" } }, connect),
+      h("header", { class: "stack", style: { gap: "10px", alignItems: "flex-start" } },
+        h("div", {},
+          h("h2", {}, `TikTok Accounts & APIs (${ttAccs.length})`),
+          h("p", { class: "hint", style: { margin: 0 } }, "Connect one or multiple named TikTok accounts via TikTok Content Posting API v2.")),
+        h("button", { class: "btn sm primary", onclick: () => openAddAccountModal("tiktok") }, "+ Add TikTok Account / API")),
+      ttAccs.length
+        ? h("div", { class: "acc-list" }, ttAccs.map(renderAccountCard))
+        : h("div", { class: "empty", style: { margin: "12px 0", padding: "18px" } }, "No TikTok API accounts added yet. Click '+ Add TikTok Account / API' to add your first account."),
+      h("div", { style: { marginBottom: "12px" } },
+        h("button", { class: "btn sm", onclick: () => openAddAccountModal("tiktok") }, "+ Add Another TikTok Account / API")),
       h("details", {},
         h("summary", { style: { cursor: "pointer", fontWeight: 650 } }, "How to configure TikTok Developer App"),
         h("ol", { class: "small" },
           h("li", {}, "Log into ", h("strong", {}, "developers.tiktok.com"), " and create an app with Content Posting API v2."),
           h("li", {}, "Under Redirect Domains / URIs, add:"),
-          h("li", { style: { listStyle: "none" } }, h("div", { class: "row" }, h("code", {}, tiktok.redirect_uri || (location.origin + "/api/tiktok/callback")), h("button", { class: "btn sm", onclick: () => { navigator.clipboard && navigator.clipboard.writeText(tiktok.redirect_uri || (location.origin + "/api/tiktok/callback")); toast("Copied."); } }, "Copy"))),
-          h("li", {}, "Paste Client Key and Client Secret above, click Connect TikTok, and authorize ClipForge.")))
+          h("li", { style: { listStyle: "none" } }, h("div", { class: "row" }, h("code", {}, redUri), h("button", { class: "btn sm", onclick: () => { navigator.clipboard && navigator.clipboard.writeText(redUri); toast("Copied."); } }, "Copy"))),
+          h("li", {}, "Click '+ Add TikTok Account / API' above, give it a name, paste the Client Key and Client Secret, and click Connect TikTok.")))
     );
   }
 
   async function load() {
-    const [s, y, tt] = await Promise.all([
+    const [s, accRes] = await Promise.all([
       api("/settings"),
-      api("/youtube/status").catch(() => ({})),
-      api("/tiktok/status").catch(() => ({}))
+      api("/accounts").catch(() => ({ accounts: [], redirect_uris: {} })),
     ]);
-    settings = s.settings; yt = y; tiktok = tt;
+    settings = s.settings;
+    accounts = accRes.accounts || [];
+    redirectUris = accRes.redirect_uris || {};
     for (const k of Object.keys(inputs)) delete inputs[k];
+    accInputs.clear();
     const sections = SCHEMA.map((sec) => h("section", { class: "panel" },
       h("header", {}, h("h2", {}, sec.title), sec.desc ? h("p", { class: "hint", style: { margin: 0 } }, sec.desc) : null),
-      sec.preview ? h("div", { class: "row", style: { alignItems: "flex-start", gap: "24px" } }, h("div", { class: "fields", style: { flex: 1 } }, sec.fields.map(field)), preview) : h("div", { class: "fields" }, sec.fields.map(field))));
+      sec.preview ? h("div", { class: "cap-settings-layout" }, h("div", { class: "fields", style: { flex: 1, minWidth: 0 } }, sec.fields.map(field)), preview) : h("div", { class: "fields" }, sec.fields.map(field))));
     sections.splice(sections.length - 1, 0, ytPanel(), tiktokPanel());
     root.replaceChildren(
-      h("div", { class: "row between" }, h("div", {}, h("h1", {}, "Settings"), h("p", { class: "sub" }, "Keys and options are stored on the server in the data folder. Secrets are never shown again after saving.")),
+      h("div", { class: "row between page-head" }, h("div", {}, h("h1", {}, "Settings"), h("p", { class: "sub" }, "Keys and options are stored on the server in the data folder. Secrets are never shown again after saving.")),
         h("button", { class: "btn primary", onclick: guard(() => save()) }, "Save settings")),
       ...sections,
       h("div", { class: "row end", style: { marginTop: "18px" } },
@@ -1176,10 +1487,10 @@ function SettingsPage(params) {
   root.append(style);
 
   load().then(() => {
-    if (params.get("yt") === "ok") toast("YouTube connected.");
+    if (params.get("yt") === "ok") toast("YouTube account connected.");
     if (params.get("yt") === "error") toast("YouTube sign-in failed: " + (params.get("msg") || "unknown error"), true);
     if (params.get("yt")) history.replaceState(null, "", "#/settings");
-    if (params.get("tiktok") === "ok") toast("TikTok connected.");
+    if (params.get("tiktok") === "ok") toast("TikTok account connected.");
     if (params.get("tiktok") === "error") toast("TikTok sign-in failed: " + (params.get("msg") || "unknown error"), true);
     if (params.get("tiktok")) history.replaceState(null, "", "#/settings");
   }).catch((e) => toast(e.message, true));

@@ -57,7 +57,10 @@ async def guard(request: Request, call_next):
                 ok = False
         if not ok:
             return Response("Password required", status_code=401, headers={"WWW-Authenticate": 'Basic realm="ClipForge"'})
-    return await call_next(request)
+    resp = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 # --------------------------------------------------------------------------
@@ -122,7 +125,32 @@ def _clip_row(c: dict) -> dict:
     out["has_thumb"] = bool(c.get("thumb_path") and Path(c["thumb_path"]).exists())
     out["path"] = c.get("path")
     out["social_copy"] = json.loads(c["social_copy"]) if c.get("social_copy") else None
+    try:
+        out["uploads"] = json.loads(c.get("uploads_json") or "{}")
+    except Exception:
+        out["uploads"] = {}
     return out
+
+
+def _account_row(a: dict, base_url: str) -> dict:
+    plat = a["platform"]
+    acc_id = a["id"]
+    is_conn = youtube.connected(acc_id) if plat == "youtube" else tiktok.connected(acc_id)
+    red_uri = youtube.redirect_uri_for(base_url) if plat == "youtube" else tiktok.redirect_uri_for(base_url)
+    return {
+        "id": acc_id,
+        "platform": plat,
+        "name": a["name"],
+        "client_id": a.get("client_id") or "",
+        "client_secret_set": bool(a.get("client_secret")),
+        "has_keys": bool(a.get("client_id") and a.get("client_secret")),
+        "privacy": a.get("privacy") or ("private" if plat == "youtube" else "PUBLIC_TO_EVERYONE"),
+        "add_shorts_tag": bool(a.get("add_shorts_tag", 1)),
+        "connected": is_conn,
+        "redirect_uri": red_uri,
+        "created": a.get("created"),
+        "updated": a.get("updated"),
+    }
 
 
 def _get_video(vid: int) -> dict:
@@ -495,6 +523,8 @@ class UploadBody(BaseModel):
     tags: list[str] = []
     privacy: str = "private"
     add_shorts_tag: bool = True
+    account_id: int | None = None
+    account_ids: list[int] = []
 
 
 @app.post("/api/clips/{cid}/youtube")
@@ -502,10 +532,18 @@ def upload_clip(cid: int, body: UploadBody):
     c = _get_clip(cid)
     if c["status"] != "ready" or not c["path"]:
         raise HTTPException(400, "Render the clip first.")
-    if c["yt_status"] == "uploading":
-        raise HTTPException(400, "Already uploading.")
-    if not youtube.connected():
-        raise HTTPException(400, "YouTube is not connected. Connect it in Settings.")
+    targets = list(body.account_ids) if body.account_ids else ([body.account_id] if body.account_id else [])
+    if targets:
+        for aid in targets:
+            if not youtube.connected(aid):
+                acc = db.one("SELECT name FROM social_accounts WHERE id=?", (aid,))
+                label = acc["name"] if acc else f"#{aid}"
+                raise HTTPException(400, f"YouTube account '{label}' is not connected. Connect it in Settings.")
+    else:
+        if not youtube.connected():
+            raise HTTPException(400, "YouTube is not connected. Connect an account in Settings.")
+        targets = [None]
+
     title = body.title.strip()
     desc = body.description.strip()
     vertical = (c["height"] or 0) > (c["width"] or 0)
@@ -514,7 +552,8 @@ def upload_clip(cid: int, body: UploadBody):
             title += " #Shorts"
         else:
             desc = (desc + "\n\n#Shorts").strip()
-    jobs.start_upload(cid, title, desc, body.tags, body.privacy)
+    for aid in targets:
+        jobs.start_upload(cid, title, desc, body.tags, body.privacy, account_id=aid)
     return {"ok": True}
 
 
@@ -524,6 +563,8 @@ def upload_clip(cid: int, body: UploadBody):
 class TikTokUploadBody(BaseModel):
     title: str
     privacy: str = "PUBLIC_TO_EVERYONE"
+    account_id: int | None = None
+    account_ids: list[int] = []
 
 
 @app.post("/api/clips/{cid}/tiktok")
@@ -531,28 +572,164 @@ def upload_clip_tiktok(cid: int, body: TikTokUploadBody):
     c = _get_clip(cid)
     if c["status"] != "ready" or not c["path"]:
         raise HTTPException(400, "Render the clip first.")
-    if c.get("tiktok_status") == "uploading":
-        raise HTTPException(400, "Already uploading to TikTok.")
-    if not tiktok.connected():
-        raise HTTPException(400, "TikTok is not connected. Connect it in Settings.")
-    jobs.start_tiktok_upload(cid, body.title.strip(), body.privacy)
+    targets = list(body.account_ids) if body.account_ids else ([body.account_id] if body.account_id else [])
+    if targets:
+        for aid in targets:
+            if not tiktok.connected(aid):
+                acc = db.one("SELECT name FROM social_accounts WHERE id=?", (aid,))
+                label = acc["name"] if acc else f"#{aid}"
+                raise HTTPException(400, f"TikTok account '{label}' is not connected. Connect it in Settings.")
+    else:
+        if not tiktok.connected():
+            raise HTTPException(400, "TikTok is not connected. Connect an account in Settings.")
+        targets = [None]
+
+    for aid in targets:
+        jobs.start_tiktok_upload(cid, body.title.strip(), body.privacy, account_id=aid)
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# Multi-Account Management (Named YouTube & TikTok APIs)
+# --------------------------------------------------------------------------
+class AccountCreate(BaseModel):
+    platform: str  # "youtube" or "tiktok"
+    name: str
+    client_id: str = ""
+    client_secret: str = ""
+    privacy: str = ""
+    add_shorts_tag: bool = True
+
+
+class AccountPatch(BaseModel):
+    name: str | None = None
+    client_id: str | None = None
+    client_secret: str | None = None
+    privacy: str | None = None
+    add_shorts_tag: bool | None = None
+
+
+@app.get("/api/accounts")
+def list_accounts(request: Request):
+    base = str(request.base_url)
+    rows = db.q("SELECT * FROM social_accounts ORDER BY platform ASC, id ASC")
+    return {
+        "accounts": [_account_row(r, base) for r in rows],
+        "redirect_uris": {
+            "youtube": youtube.redirect_uri_for(base),
+            "tiktok": tiktok.redirect_uri_for(base),
+        },
+    }
+
+
+@app.post("/api/accounts")
+def create_account(body: AccountCreate, request: Request):
+    plat = body.platform.strip().lower()
+    if plat not in ("youtube", "tiktok"):
+        raise HTTPException(400, "Platform must be 'youtube' or 'tiktok'.")
+    name = body.name.strip()[:80]
+    if not name:
+        raise HTTPException(400, "Give this API account a name so you can identify it.")
+    default_priv = "private" if plat == "youtube" else "PUBLIC_TO_EVERYONE"
+    priv = body.privacy.strip() or default_priv
+    aid = db.insert(
+        "social_accounts",
+        platform=plat,
+        name=name,
+        client_id=body.client_id.strip(),
+        client_secret=body.client_secret.strip(),
+        privacy=priv,
+        add_shorts_tag=1 if body.add_shorts_tag else 0,
+    )
+    row = db.one("SELECT * FROM social_accounts WHERE id=?", (aid,))
+    return {"account": _account_row(row, str(request.base_url))}
+
+
+@app.patch("/api/accounts/{acc_id}")
+def update_account(acc_id: int, body: AccountPatch, request: Request):
+    row = db.one("SELECT * FROM social_accounts WHERE id=?", (acc_id,))
+    if not row:
+        raise HTTPException(404, "Account not found")
+    fields = {}
+    if body.name is not None:
+        n = body.name.strip()[:80]
+        if not n:
+            raise HTTPException(400, "Account name cannot be empty.")
+        fields["name"] = n
+    if body.client_id is not None:
+        fields["client_id"] = body.client_id.strip()
+    if body.client_secret is not None and body.client_secret != "" and body.client_secret != config.MASK:
+        fields["client_secret"] = body.client_secret.strip()
+    if body.privacy is not None:
+        fields["privacy"] = body.privacy.strip()
+    if body.add_shorts_tag is not None:
+        fields["add_shorts_tag"] = 1 if body.add_shorts_tag else 0
+    if fields:
+        db.update("social_accounts", acc_id, **fields)
+    updated = db.one("SELECT * FROM social_accounts WHERE id=?", (acc_id,))
+    return {"account": _account_row(updated, str(request.base_url))}
+
+
+@app.delete("/api/accounts/{acc_id}")
+def delete_account(acc_id: int):
+    row = db.one("SELECT * FROM social_accounts WHERE id=?", (acc_id,))
+    if not row:
+        raise HTTPException(404, "Account not found")
+    if row["platform"] == "youtube":
+        youtube.disconnect(acc_id)
+    else:
+        tiktok.disconnect(acc_id)
+    db.ex("DELETE FROM social_accounts WHERE id=?", (acc_id,))
+    return {"ok": True}
+
+
+@app.get("/api/accounts/{acc_id}/connect")
+def connect_account(acc_id: int, request: Request):
+    row = db.one("SELECT * FROM social_accounts WHERE id=?", (acc_id,))
+    if not row:
+        raise HTTPException(404, "Account not found")
+    base = str(request.base_url)
+    try:
+        if row["platform"] == "youtube":
+            url = youtube.auth_url(row, youtube.redirect_uri_for(base))
+        else:
+            url = tiktok.auth_url(row, tiktok.redirect_uri_for(base))
+    except (youtube.YouTubeError, tiktok.TikTokError) as e:
+        raise HTTPException(400, str(e))
+    return {"url": url}
+
+
+@app.post("/api/accounts/{acc_id}/disconnect")
+def disconnect_account(acc_id: int):
+    row = db.one("SELECT * FROM social_accounts WHERE id=?", (acc_id,))
+    if not row:
+        raise HTTPException(404, "Account not found")
+    if row["platform"] == "youtube":
+        youtube.disconnect(acc_id)
+    else:
+        tiktok.disconnect(acc_id)
     return {"ok": True}
 
 
 @app.get("/api/tiktok/status")
 def tiktok_status_api(request: Request):
     cfg = config.get()
+    rows = db.q("SELECT * FROM social_accounts WHERE platform='tiktok' ORDER BY id ASC")
+    has_keys = any(r.get("client_id") and r.get("client_secret") for r in rows) or bool(
+        cfg.get("tiktok_client_key") and cfg.get("tiktok_client_secret")
+    )
     return {
         "connected": tiktok.connected(),
-        "has_keys": bool(cfg.get("tiktok_client_key") and cfg.get("tiktok_client_secret")),
+        "has_keys": has_keys,
         "redirect_uri": tiktok.redirect_uri_for(str(request.base_url)),
     }
 
 
 @app.get("/api/tiktok/connect")
-def tiktok_connect_api(request: Request):
+def tiktok_connect_api(request: Request, account_id: int | None = None):
     try:
-        url = tiktok.auth_url(config.get(), tiktok.redirect_uri_for(str(request.base_url)))
+        target = account_id if account_id is not None else config.get()
+        url = tiktok.auth_url(target, tiktok.redirect_uri_for(str(request.base_url)))
     except tiktok.TikTokError as e:
         raise HTTPException(400, str(e))
     return {"url": url}
@@ -571,8 +748,8 @@ def tiktok_callback_api(request: Request, state: str = "", code: str = "", error
 
 
 @app.post("/api/tiktok/disconnect")
-def tiktok_disconnect_api():
-    tiktok.disconnect()
+def tiktok_disconnect_api(account_id: int | None = None):
+    tiktok.disconnect(account_id)
     return {"ok": True}
 
 
@@ -604,7 +781,9 @@ def generate_social_copy_api(cid: int):
 # --------------------------------------------------------------------------
 class ScheduleCreate(BaseModel):
     clip_ids: list[int]
-    platforms: list[str]  # e.g. ["youtube", "tiktok"]
+    platforms: list[str] = []  # legacy support: ["youtube", "tiktok"]
+    account_ids: list[int] = []  # default named account IDs for all selected clips
+    clip_accounts: dict[str, list[int]] = {}  # per-clip override: {"<clip_id>": [acc_id1, acc_id2]}
     mode: str = "time"  # "time" or "interval"
     start_time: float  # unix timestamp
     interval_minutes: int = 60
@@ -620,13 +799,22 @@ def list_scheduled():
         "LEFT JOIN clips c ON s.clip_id = c.id "
         "ORDER BY s.scheduled_time ASC"
     )
+    acc_map = {a["id"]: a for a in db.q("SELECT id, name, platform FROM social_accounts")}
     out = []
     for r in rows:
         d = dict(r)
-        d["platforms"] = json.loads(d["platforms"] or "[]")
-        d["options"] = json.loads(d["options"] or "{}")
-        d["results"] = json.loads(d["results"] or "{}")
+        d["platforms"] = json.loads(d.get("platforms") or "[]")
+        d["accounts"] = json.loads(d.get("accounts") or "[]")
+        d["options"] = json.loads(d.get("options") or "{}")
+        d["results"] = json.loads(d.get("results") or "{}")
         d["has_thumb"] = bool(d.get("thumb_path") and Path(d["thumb_path"]).exists())
+        details = []
+        for aid in d["accounts"]:
+            if aid in acc_map:
+                details.append(acc_map[aid])
+            else:
+                details.append({"id": aid, "name": f"Account #{aid}", "platform": "unknown"})
+        d["account_details"] = details
         out.append(d)
     return {"scheduled": out}
 
@@ -635,9 +823,12 @@ def list_scheduled():
 def create_scheduled(body: ScheduleCreate):
     if not body.clip_ids:
         raise HTTPException(400, "No clips selected.")
-    if not body.platforms:
-        raise HTTPException(400, "Select at least one platform (YouTube or TikTok).")
 
+    has_any_target = bool(body.account_ids or body.platforms or any(body.clip_accounts.values()))
+    if not has_any_target:
+        raise HTTPException(400, "Select at least one destination API account.")
+
+    acc_map = {a["id"]: a for a in db.q("SELECT * FROM social_accounts")}
     start_t = max(time.time(), float(body.start_time))
     interval_sec = max(1, int(body.interval_minutes)) * 60
     created_ids = []
@@ -646,19 +837,34 @@ def create_scheduled(body: ScheduleCreate):
         c = db.one("SELECT * FROM clips WHERE id=?", (cid,))
         if not c or c["status"] != "ready":
             continue
-        sch_time = start_t + (idx * interval_sec if body.mode == "interval" else 0)
 
+        # Resolve target accounts for this specific clip
+        clip_acc_ids = body.clip_accounts.get(str(cid))
+        if clip_acc_ids is None:
+            clip_acc_ids = list(body.account_ids)
+
+        valid_acc_ids = [aid for aid in clip_acc_ids if aid in acc_map]
+        plats = list({acc_map[aid]["platform"] for aid in valid_acc_ids}) if valid_acc_ids else list(body.platforms)
+        if not valid_acc_ids and not plats:
+            continue
+
+        sch_time = start_t + (idx * interval_sec if body.mode == "interval" else 0)
         clip_opts = dict(body.options)
-        # Ensure default title if not provided
-        if "youtube" in body.platforms and "youtube" not in clip_opts:
-            clip_opts["youtube"] = {"title": c["title"], "privacy": "private"}
-        if "tiktok" in body.platforms and "tiktok" not in clip_opts:
-            clip_opts["tiktok"] = {"title": c["title"], "privacy": "PUBLIC_TO_EVERYONE"}
+        for aid in valid_acc_ids:
+            acc = acc_map[aid]
+            akey = f"account_{aid}"
+            if akey not in clip_opts:
+                clip_opts[akey] = {
+                    "title": c["title"],
+                    "privacy": acc.get("privacy") or ("private" if acc["platform"] == "youtube" else "PUBLIC_TO_EVERYONE"),
+                    "add_shorts_tag": bool(acc.get("add_shorts_tag", 1)),
+                }
 
         sid = db.insert(
             "scheduled_uploads",
             clip_id=cid,
-            platforms=json.dumps(body.platforms),
+            platforms=json.dumps(plats),
+            accounts=json.dumps(valid_acc_ids),
             scheduled_time=sch_time,
             status="pending",
             options=json.dumps(clip_opts),
@@ -666,6 +872,8 @@ def create_scheduled(body: ScheduleCreate):
         )
         created_ids.append(sid)
 
+    if not created_ids:
+        raise HTTPException(400, "No valid ready clips or accounts selected to schedule.")
     return {"created": len(created_ids), "ids": created_ids}
 
 
@@ -695,17 +903,22 @@ def retry_scheduled(sched_id: int):
 @app.get("/api/youtube/status")
 def yt_status(request: Request):
     cfg = config.get()
+    rows = db.q("SELECT * FROM social_accounts WHERE platform='youtube' ORDER BY id ASC")
+    has_keys = any(r.get("client_id") and r.get("client_secret") for r in rows) or bool(
+        cfg.get("yt_client_id") and cfg.get("yt_client_secret")
+    )
     return {
         "connected": youtube.connected(),
-        "has_keys": bool(cfg["yt_client_id"] and cfg["yt_client_secret"]),
+        "has_keys": has_keys,
         "redirect_uri": youtube.redirect_uri_for(str(request.base_url)),
     }
 
 
 @app.get("/api/youtube/connect")
-def yt_connect(request: Request):
+def yt_connect(request: Request, account_id: int | None = None):
     try:
-        url = youtube.auth_url(config.get(), youtube.redirect_uri_for(str(request.base_url)))
+        target = account_id if account_id is not None else config.get()
+        url = youtube.auth_url(target, youtube.redirect_uri_for(str(request.base_url)))
     except youtube.YouTubeError as e:
         raise HTTPException(400, str(e))
     return {"url": url}
@@ -723,8 +936,8 @@ def yt_callback(request: Request, state: str = "", code: str = "", error: str = 
 
 
 @app.post("/api/youtube/disconnect")
-def yt_disconnect():
-    youtube.disconnect()
+def yt_disconnect(account_id: int | None = None):
+    youtube.disconnect(account_id)
     return {"ok": True}
 
 

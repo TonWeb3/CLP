@@ -79,7 +79,7 @@ _cache: dict | None = None
 
 
 def ensure_dirs() -> None:
-    for sub in ("", "videos", "models", "models/whisper", "fonts"):
+    for sub in ("", "videos", "models", "models/whisper", "fonts", "tokens"):
         (DATA_DIR / sub).mkdir(parents=True, exist_ok=True)
     clips_dir().mkdir(parents=True, exist_ok=True)
 

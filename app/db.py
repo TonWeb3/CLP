@@ -1,6 +1,7 @@
 """Tiny SQLite helper (stdlib only)."""
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import threading
 import time
@@ -29,15 +30,30 @@ CREATE TABLE IF NOT EXISTS clips(
   render_opts TEXT,
   yt_status TEXT, yt_progress REAL DEFAULT 0, yt_id TEXT, yt_error TEXT,
   tiktok_status TEXT, tiktok_progress REAL DEFAULT 0, tiktok_id TEXT, tiktok_error TEXT,
+  uploads_json TEXT DEFAULT '{}',
   social_copy TEXT,
   created REAL, updated REAL
 );
 CREATE INDEX IF NOT EXISTS idx_clips_video ON clips(video_id);
 
+CREATE TABLE IF NOT EXISTS social_accounts(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  platform TEXT NOT NULL,
+  name TEXT NOT NULL,
+  client_id TEXT DEFAULT '',
+  client_secret TEXT DEFAULT '',
+  privacy TEXT DEFAULT '',
+  add_shorts_tag INTEGER DEFAULT 1,
+  created REAL,
+  updated REAL
+);
+CREATE INDEX IF NOT EXISTS idx_social_platform ON social_accounts(platform);
+
 CREATE TABLE IF NOT EXISTS scheduled_uploads(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   clip_id INTEGER,
   platforms TEXT,
+  accounts TEXT DEFAULT '[]',
   scheduled_time REAL,
   status TEXT DEFAULT 'pending',
   options TEXT,
@@ -53,6 +69,7 @@ CREATE INDEX IF NOT EXISTS idx_sched_status_time ON scheduled_uploads(status, sc
 def init() -> None:
     global _conn
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (config.DATA_DIR / "tokens").mkdir(parents=True, exist_ok=True)
     with _lock:
         if _conn is not None:
             _conn.close()
@@ -69,10 +86,60 @@ def init() -> None:
             ("tiktok_progress", "REAL DEFAULT 0"),
             ("tiktok_id", "TEXT"),
             ("tiktok_error", "TEXT"),
+            ("uploads_json", "TEXT DEFAULT '{}'"),
             ("social_copy", "TEXT"),
         ]:
             if col not in clip_cols:
                 _conn.execute(f"ALTER TABLE clips ADD COLUMN {col} {ctype};")
+
+        sched_cols = {r["name"] for r in _conn.execute("PRAGMA table_info(scheduled_uploads)").fetchall()}
+        if "accounts" not in sched_cols:
+            _conn.execute("ALTER TABLE scheduled_uploads ADD COLUMN accounts TEXT DEFAULT '[]';")
+
+        # Seed or migrate default accounts if none exist for a platform
+        yt_count = _conn.execute("SELECT COUNT(*) AS n FROM social_accounts WHERE platform='youtube'").fetchone()["n"]
+        if yt_count == 0:
+            cfg = config.get()
+            now = time.time()
+            old_yt_token = config.DATA_DIR / "youtube_token.json"
+            cur = _conn.execute(
+                "INSERT INTO social_accounts(platform, name, client_id, client_secret, privacy, add_shorts_tag, created, updated) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "youtube",
+                    "YouTube #1",
+                    cfg.get("yt_client_id", ""),
+                    cfg.get("yt_client_secret", ""),
+                    cfg.get("yt_privacy", "private"),
+                    1 if cfg.get("yt_add_shorts_tag", True) else 0,
+                    now,
+                    now,
+                ),
+            )
+            if old_yt_token.exists():
+                shutil.copy2(old_yt_token, config.DATA_DIR / "tokens" / f"youtube_{cur.lastrowid}.json")
+
+        tt_count = _conn.execute("SELECT COUNT(*) AS n FROM social_accounts WHERE platform='tiktok'").fetchone()["n"]
+        if tt_count == 0:
+            cfg = config.get()
+            now = time.time()
+            old_tt_token = config.DATA_DIR / "tiktok_token.json"
+            cur = _conn.execute(
+                "INSERT INTO social_accounts(platform, name, client_id, client_secret, privacy, add_shorts_tag, created, updated) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "tiktok",
+                    "TikTok #1",
+                    cfg.get("tiktok_client_key", ""),
+                    cfg.get("tiktok_client_secret", ""),
+                    cfg.get("tiktok_privacy", "PUBLIC_TO_EVERYONE"),
+                    0,
+                    now,
+                    now,
+                ),
+            )
+            if old_tt_token.exists():
+                shutil.copy2(old_tt_token, config.DATA_DIR / "tokens" / f"tiktok_{cur.lastrowid}.json")
 
         _conn.commit()
 
