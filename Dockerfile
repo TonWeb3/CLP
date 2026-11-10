@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     CLIPFORGE_HOST=0.0.0.0 \
-    CLIPFORGE_PORT=8000 \
+    CLIPFORGE_PORT=8120 \
     CLIPFORGE_DATA=/data
 
 WORKDIR /app
@@ -29,7 +29,7 @@ RUN mkdir -p /data
 VOLUME /data
 
 # Expose web interface port
-EXPOSE 8000
+EXPOSE 8120
 
 # Start ClipForge
 CMD ["python", "main.py"]

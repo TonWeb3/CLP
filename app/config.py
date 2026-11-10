@@ -69,7 +69,7 @@ DEFAULTS: dict = {
     # --- TikTok upload ---------------------------------------------------
     "tiktok_client_key": "",
     "tiktok_client_secret": "",
-    "tiktok_privacy": "PUBLIC_TO_EVERYONE",  # PUBLIC_TO_EVERYONE | MUTUAL_FOLLOW_FRIENDS | SELF_ONLY
+    "tiktok_privacy": "INBOX",  # INBOX | SELF_ONLY | MUTUAL_FOLLOW_FRIENDS | PUBLIC_TO_EVERYONE
 }
 
 SECRET_KEYS = {"llm_api_key", "cookies", "yt_client_secret", "tiktok_client_secret"}

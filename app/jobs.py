@@ -397,7 +397,7 @@ def _process_scheduled_upload(item: dict) -> None:
                 elif plat == "tiktok":
                     tt_opts = opts.get(f"account_{acc_id}") or opts.get("tiktok") or {}
                     tt_title = tt_opts.get("title") or clip["title"]
-                    tt_priv = tt_opts.get("privacy") or acc.get("privacy") or "PUBLIC_TO_EVERYONE"
+                    tt_priv = tt_opts.get("privacy") or acc.get("privacy") or "INBOX"
                     try:
                         _update_clip_account_upload(clip["id"], acc_key, {
                             "account_id": acc_id, "name": acc_name, "platform": "tiktok", "status": "uploading", "progress": 0.1

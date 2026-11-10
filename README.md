@@ -22,10 +22,10 @@ unzip clipforge.zip && cd clipforge
 ./start.sh
 ```
 
-The first run installs the Python packages. Then open **http://localhost:8000**.
+The first run installs the Python packages. Then open **http://localhost:8120**.
 
 **Using a remote server?**
-Simply open **`http://your-server-ip:8000`** in your browser. (Optional: you can also set `CLIPFORGE_PASSWORD='your-password'` if you want to add password protection, or tunnel via `ssh -L 8000:localhost:8000 user@your-server`).
+Simply open **`http://your-server-ip:8120`** in your browser. (Optional: you can also set `CLIPFORGE_PASSWORD='your-password'` if you want to add password protection, or tunnel via `ssh -L 8120:localhost:8120 user@your-server`).
 
 ## First run, all from the browser
 
@@ -61,7 +61,7 @@ You need your own free Google OAuth keys:
 
 1. In Google Cloud Console, create a project and enable **YouTube Data API v3**.
 2. Configure the OAuth consent screen (External) and add your Google account as a test user.
-3. Create an OAuth client ID of type **Web application**. Add the redirect URI shown on the Settings page, exactly: `http://localhost:8000/api/youtube/callback`.
+3. Create an OAuth client ID of type **Web application**. Add the redirect URI shown on the Settings page, exactly: `http://localhost:8120/api/youtube/callback`.
 4. Paste the client ID and secret into Settings, press **Connect YouTube**, and approve access.
 
 Things to know:
@@ -71,15 +71,28 @@ Things to know:
 - YouTube keeps uploads from unverified API projects **private** until the project passes Google's audit. You can still switch a video to public by hand in YouTube Studio.
 - Each upload costs 1,600 of the default 10,000 daily quota units, so about 6 uploads a day.
 
+## Uploading to TikTok (Sandbox & Multi-Account)
+
+ClipForge supports uploading directly or via **Inbox Draft Mode** using TikTok's Content Posting API v2:
+
+1. In the **TikTok Developer Portal** (`developers.tiktok.com`), create an app and open the **Sandbox** tab (next to Production). No app review or audit is required.
+2. Under Products, add **Login Kit** and **Content Posting API**. Leave **Upload to TikTok** enabled (this powers Inbox Draft mode).
+3. Under Login Kit, register your exact HTTPS callback URL (e.g. `https://your-tunnel-url/api/tiktok/callback`).
+4. Under **Roles & Access (Target Users)**, add up to 10 TikTok accounts you own and accept the developer terms on each account.
+5. In ClipForge Settings -> TikTok Accounts, click **+ Add TikTok Account / API**.
+6. Use the **same Sandbox Client Key & Secret** across all your TikTok accounts. Name each account so you can tell them apart.
+7. Click **Connect TikTok** for each row while logged into that account to save its authentication token.
+8. **Why Inbox Mode?** Unaudited apps cannot post public videos directly. Inbox mode sends the clip directly into your TikTok app inbox as an editable draft. You receive a notification on your phone and tap Post with full public visibility!
+
 ## Where things are stored
 
 ```
 data/settings.json    your settings
 data/clipforge.db     videos and clips
+data/tokens/          OAuth tokens for named YouTube and TikTok accounts
 data/videos/<id>/     downloaded source, audio, transcript
 data/models/whisper/  speech models
 data/clips/           rendered clips (or the folder you chose in Settings)
-data/youtube_token.json
 ```
 
 Set `CLIPFORGE_DATA=/some/path` to keep all of this somewhere else.

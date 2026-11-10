@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS social_accounts(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   platform TEXT NOT NULL,
   name TEXT NOT NULL,
+  username TEXT DEFAULT '',
+  scope TEXT DEFAULT '',
   client_id TEXT DEFAULT '',
   client_secret TEXT DEFAULT '',
   privacy TEXT DEFAULT '',
@@ -96,6 +98,11 @@ def init() -> None:
         if "accounts" not in sched_cols:
             _conn.execute("ALTER TABLE scheduled_uploads ADD COLUMN accounts TEXT DEFAULT '[]';")
 
+        acc_cols = {r["name"] for r in _conn.execute("PRAGMA table_info(social_accounts)").fetchall()}
+        for col, ctype in [("username", "TEXT DEFAULT ''"), ("scope", "TEXT DEFAULT ''")]:
+            if col not in acc_cols:
+                _conn.execute(f"ALTER TABLE social_accounts ADD COLUMN {col} {ctype};")
+
         # Seed or migrate default accounts if none exist for a platform
         yt_count = _conn.execute("SELECT COUNT(*) AS n FROM social_accounts WHERE platform='youtube'").fetchone()["n"]
         if yt_count == 0:
@@ -132,7 +139,7 @@ def init() -> None:
                     "TikTok #1",
                     cfg.get("tiktok_client_key", ""),
                     cfg.get("tiktok_client_secret", ""),
-                    cfg.get("tiktok_privacy", "PUBLIC_TO_EVERYONE"),
+                    cfg.get("tiktok_privacy", "INBOX"),
                     0,
                     now,
                     now,

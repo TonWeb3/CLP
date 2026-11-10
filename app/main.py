@@ -58,8 +58,9 @@ async def guard(request: Request, call_next):
         if not ok:
             return Response("Password required", status_code=401, headers={"WWW-Authenticate": 'Basic realm="ClipForge"'})
     resp = await call_next(request)
-    if request.url.path.startswith("/static/"):
-        resp.headers["Cache-Control"] = "no-cache"
+    if request.url.path.startswith("/static/") or request.url.path == "/":
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
     return resp
 
 
@@ -137,14 +138,17 @@ def _account_row(a: dict, base_url: str) -> dict:
     acc_id = a["id"]
     is_conn = youtube.connected(acc_id) if plat == "youtube" else tiktok.connected(acc_id)
     red_uri = youtube.redirect_uri_for(base_url) if plat == "youtube" else tiktok.redirect_uri_for(base_url)
+    default_priv = "private" if plat == "youtube" else "INBOX"
     return {
         "id": acc_id,
         "platform": plat,
         "name": a["name"],
+        "username": a.get("username") or "",
+        "scope": a.get("scope") or "",
         "client_id": a.get("client_id") or "",
         "client_secret_set": bool(a.get("client_secret")),
         "has_keys": bool(a.get("client_id") and a.get("client_secret")),
-        "privacy": a.get("privacy") or ("private" if plat == "youtube" else "PUBLIC_TO_EVERYONE"),
+        "privacy": a.get("privacy") or default_priv,
         "add_shorts_tag": bool(a.get("add_shorts_tag", 1)),
         "connected": is_conn,
         "redirect_uri": red_uri,
@@ -561,8 +565,8 @@ def upload_clip(cid: int, body: UploadBody):
 # TikTok upload & connection
 # --------------------------------------------------------------------------
 class TikTokUploadBody(BaseModel):
-    title: str
-    privacy: str = "PUBLIC_TO_EVERYONE"
+    title: str = ""
+    privacy: str = "INBOX"
     account_id: int | None = None
     account_ids: list[int] = []
 
@@ -598,6 +602,7 @@ class AccountCreate(BaseModel):
     client_id: str = ""
     client_secret: str = ""
     privacy: str = ""
+    scope: str = ""
     add_shorts_tag: bool = True
 
 
@@ -606,6 +611,7 @@ class AccountPatch(BaseModel):
     client_id: str | None = None
     client_secret: str | None = None
     privacy: str | None = None
+    scope: str | None = None
     add_shorts_tag: bool | None = None
 
 
@@ -630,7 +636,7 @@ def create_account(body: AccountCreate, request: Request):
     name = body.name.strip()[:80]
     if not name:
         raise HTTPException(400, "Give this API account a name so you can identify it.")
-    default_priv = "private" if plat == "youtube" else "PUBLIC_TO_EVERYONE"
+    default_priv = "private" if plat == "youtube" else "INBOX"
     priv = body.privacy.strip() or default_priv
     aid = db.insert(
         "social_accounts",
@@ -639,6 +645,7 @@ def create_account(body: AccountCreate, request: Request):
         client_id=body.client_id.strip(),
         client_secret=body.client_secret.strip(),
         privacy=priv,
+        scope=body.scope.strip(),
         add_shorts_tag=1 if body.add_shorts_tag else 0,
     )
     row = db.one("SELECT * FROM social_accounts WHERE id=?", (aid,))
@@ -662,6 +669,8 @@ def update_account(acc_id: int, body: AccountPatch, request: Request):
         fields["client_secret"] = body.client_secret.strip()
     if body.privacy is not None:
         fields["privacy"] = body.privacy.strip()
+    if body.scope is not None:
+        fields["scope"] = body.scope.strip()
     if body.add_shorts_tag is not None:
         fields["add_shorts_tag"] = 1 if body.add_shorts_tag else 0
     if fields:
@@ -693,10 +702,18 @@ def connect_account(acc_id: int, request: Request):
         if row["platform"] == "youtube":
             url = youtube.auth_url(row, youtube.redirect_uri_for(base))
         else:
-            url = tiktok.auth_url(row, tiktok.redirect_uri_for(base))
+            url = tiktok.auth_url(row, tiktok.redirect_uri_for(base), scope=row.get("scope"))
     except (youtube.YouTubeError, tiktok.TikTokError) as e:
         raise HTTPException(400, str(e))
     return {"url": url}
+
+
+@app.get("/api/accounts/{acc_id}/creator-info")
+def account_creator_info(acc_id: int):
+    row = db.one("SELECT * FROM social_accounts WHERE id=?", (acc_id,))
+    if not row or row["platform"] != "tiktok":
+        raise HTTPException(404, "TikTok account not found")
+    return tiktok.get_creator_info(row)
 
 
 @app.post("/api/accounts/{acc_id}/disconnect")
@@ -856,7 +873,7 @@ def create_scheduled(body: ScheduleCreate):
             if akey not in clip_opts:
                 clip_opts[akey] = {
                     "title": c["title"],
-                    "privacy": acc.get("privacy") or ("private" if acc["platform"] == "youtube" else "PUBLIC_TO_EVERYONE"),
+                    "privacy": acc.get("privacy") or ("private" if acc["platform"] == "youtube" else "INBOX"),
                     "add_shorts_tag": bool(acc.get("add_shorts_tag", 1)),
                 }
 

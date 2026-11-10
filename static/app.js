@@ -548,10 +548,11 @@ function LibraryPage() {
 
     const title = h("input", { type: "text", value: c.title, maxLength: 150 });
     const priv = h("select", {}, [
-      ["PUBLIC_TO_EVERYONE", "Public to everyone"],
-      ["MUTUAL_FOLLOW_FRIENDS", "Friends only"],
-      ["SELF_ONLY", "Only me (Private)"]
-    ].map(([v, t]) => h("option", { value: v, selected: v === (accs[0].privacy || st.tiktok_privacy || "PUBLIC_TO_EVERYONE") }, t)));
+      ["INBOX", "Send to TikTok inbox (finish in app as draft) - Recommended for Sandbox"],
+      ["SELF_ONLY", "Only me (Private Direct Post)"],
+      ["MUTUAL_FOLLOW_FRIENDS", "Friends only (Audited app)"],
+      ["PUBLIC_TO_EVERYONE", "Public to everyone (Audited app)"]
+    ].map(([v, t]) => h("option", { value: v, selected: v === (accs[0].privacy || st.tiktok_privacy || "INBOX") }, t)));
 
     const go = h("button", { class: "btn primary", onclick: guard(async () => {
       if (!chosen.size) { toast("Select at least one TikTok account.", true); return; }
@@ -654,12 +655,12 @@ function LibraryPage() {
         for (const u of ttUploads) {
           const nm = u.name || "TikTok";
           if (u.status === "uploading") ttBox.append(h("div", {}, chip(`${nm}: ${Math.round((u.progress || 0) * 100)}%`, "info")));
-          else if (u.status === "done") ttBox.append(h("div", {}, chip(nm, "ok"), " Published"));
+          else if (u.status === "done") ttBox.append(h("div", {}, chip(nm, "ok"), " Sent to Inbox / Published"));
           else if (u.status === "failed") ttBox.append(h("div", {}, chip(`${nm} failed`, "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, u.error || "")));
         }
       } else {
         if (c.tiktok_status === "uploading") ttBox.append(chip("TikTok: " + Math.round(c.tiktok_progress * 100) + "%", "info"));
-        else if (c.tiktok_status === "done") ttBox.append(chip("TikTok", "ok"), " Published");
+        else if (c.tiktok_status === "done") ttBox.append(chip("TikTok", "ok"), " Sent to Inbox / Published");
         else if (c.tiktok_status === "failed") ttBox.append(chip("TikTok failed", "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, c.tiktok_error || ""));
       }
       ttBar.style.display = c.tiktok_status === "uploading" ? "" : "none";
@@ -1242,6 +1243,7 @@ function SettingsPage(params) {
     };
     if (ref.client_secret.value) patch.client_secret = ref.client_secret.value.trim();
     if (ref.add_shorts_tag) patch.add_shorts_tag = ref.add_shorts_tag.checked;
+    if (ref.scope) patch.scope = ref.scope.value;
     await api(`/accounts/${accId}`, { method: "PATCH", json: patch });
     if (!silent) toast(`Saved "${patch.name}".`);
   }
@@ -1264,7 +1266,7 @@ function SettingsPage(params) {
     return r;
   }
 
-  function openAddAccountModal(platform) {
+  function openAddAccountModal(platform = "youtube") {
     const isYT = platform === "youtube";
     const count = accounts.filter((a) => a.platform === platform).length + 1;
     const nameIn = h("input", { type: "text", value: `${isYT ? "YouTube" : "TikTok"} Account #${count}`, placeholder: isYT ? "e.g. Main YouTube, Shorts Channel 2" : "e.g. Main TikTok, Clips TikTok 2" });
@@ -1272,8 +1274,18 @@ function SettingsPage(params) {
     const secIn = h("input", { type: "password", autocomplete: "off", placeholder: isYT ? "Google OAuth Client Secret" : "TikTok Client Secret" });
     const privIn = h("select", {}, (isYT
       ? [["private", "Private"], ["unlisted", "Unlisted"], ["public", "Public"]]
-      : [["PUBLIC_TO_EVERYONE", "Public to everyone"], ["MUTUAL_FOLLOW_FRIENDS", "Friends only"], ["SELF_ONLY", "Only me (Private)"]]
+      : [
+          ["INBOX", "Send to TikTok inbox (finish in app as draft) - Recommended for Sandbox"],
+          ["SELF_ONLY", "Only me (Private Direct Post)"],
+          ["MUTUAL_FOLLOW_FRIENDS", "Friends only (Audited app)"],
+          ["PUBLIC_TO_EVERYONE", "Public to everyone (Audited app)"],
+        ]
     ).map(([v, l]) => h("option", { value: v }, l)));
+    const scopeIn = !isYT ? h("select", {}, [
+      ["video.upload", "Upload to TikTok (Inbox draft mode - Sandbox default)"],
+      ["video.upload,video.publish", "Inbox + Direct Post (Requires both scopes in portal)"],
+      ["video.publish", "Direct Post only (Requires video.publish)"],
+    ].map(([v, l]) => h("option", { value: v }, l))) : null;
     const shortsIn = h("input", { type: "checkbox", checked: true });
 
     const createBtn = h("button", { class: "btn primary", onclick: guard(async () => {
@@ -1288,6 +1300,7 @@ function SettingsPage(params) {
             client_id: idIn.value.trim(),
             client_secret: secIn.value.trim(),
             privacy: privIn.value,
+            scope: isYT ? "" : (scopeIn ? scopeIn.value : ""),
             add_shorts_tag: isYT ? shortsIn.checked : false,
           }
         });
@@ -1299,11 +1312,15 @@ function SettingsPage(params) {
 
     const close = modal(h("div", { class: "stack" },
       h("h2", {}, `Add ${isYT ? "YouTube" : "TikTok"} API Account`),
-      h("p", { class: "hint", style: { margin: 0 } }, "Give this API connection a clear name so you can select it in the Library and Publisher automations."),
+      h("p", { class: "hint", style: { margin: 0 } }, isYT
+        ? "Give this API connection a clear name so you can select it in the Library and Publisher automations."
+        : "Connect a TikTok account."),
       h("label", { class: "field" }, h("span", { class: "lbl" }, "Account / API Name"), nameIn),
       h("label", { class: "field" }, h("span", { class: "lbl" }, isYT ? "Google OAuth Client ID" : "TikTok Client Key"), idIn),
       h("label", { class: "field" }, h("span", { class: "lbl" }, isYT ? "Google OAuth Client Secret" : "TikTok Client Secret"), secIn),
-      h("label", { class: "field" }, h("span", { class: "lbl" }, "Default visibility / privacy"), privIn),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Default posting mode / privacy"), privIn),
+      !isYT ? h("label", { class: "field" }, h("span", { class: "lbl" }, "OAuth Permission Scope"), scopeIn,
+        h("span", { class: "hint" }, "In Sandbox, 'Upload to TikTok' is enabled by default (video.upload). Choose that unless you also enabled Direct Post in your portal.")) : null,
       isYT ? h("label", { class: "check" }, shortsIn, h("span", { style: { fontWeight: 650 } }, "Add #Shorts to vertical clips")) : null,
       h("div", { class: "row end", style: { marginTop: "8px" } },
         h("button", { class: "btn", onclick: () => close() }, "Cancel"),
@@ -1312,16 +1329,26 @@ function SettingsPage(params) {
 
   function renderAccountCard(acc) {
     const isYT = acc.platform === "youtube";
-    const nameIn = h("input", { type: "text", value: acc.name, placeholder: "Account name" });
-    const idIn = h("input", { type: "text", value: acc.client_id || "" });
-    const secIn = h("input", { type: "password", autocomplete: "off", placeholder: acc.client_secret_set ? "Saved. Type to replace." : "Not set" });
+    const nameIn = h("input", { type: "text", value: acc.name, placeholder: isYT ? "Account / API name" : "Account name" });
+    const idIn = isYT ? h("input", { type: "text", value: acc.client_id || "", placeholder: "Google OAuth Client ID" }) : null;
+    const secIn = isYT ? h("input", { type: "password", autocomplete: "off", placeholder: acc.client_secret_set ? "Saved. Type to replace." : "Google OAuth Client Secret" }) : null;
     const privIn = h("select", {}, (isYT
       ? [["private", "Private"], ["unlisted", "Unlisted"], ["public", "Public"]]
-      : [["PUBLIC_TO_EVERYONE", "Public to everyone"], ["MUTUAL_FOLLOW_FRIENDS", "Friends only"], ["SELF_ONLY", "Only me (Private)"]]
-    ).map(([v, l]) => h("option", { value: v, selected: acc.privacy === v }, l)));
+      : [
+          ["INBOX", "Send to TikTok inbox (finish in app as draft) - Recommended for Sandbox"],
+          ["SELF_ONLY", "Only me (Private Direct Post)"],
+          ["MUTUAL_FOLLOW_FRIENDS", "Friends only"],
+          ["PUBLIC_TO_EVERYONE", "Public to everyone"]
+        ]
+    ).map(([v, l]) => h("option", { value: v, selected: (acc.privacy || (isYT ? "private" : "INBOX")) === v }, l)));
+    const scopeIn = !isYT ? h("select", {}, [
+      ["video.upload", "Upload to TikTok (video.upload)"],
+      ["video.upload,video.publish", "Inbox + Direct Post (video.upload,video.publish)"],
+      ["video.publish", "Direct Post only (video.publish)"],
+    ].map(([v, l]) => h("option", { value: v, selected: (acc.scope || "video.upload") === v }, l))) : null;
     const shortsIn = isYT ? h("input", { type: "checkbox", checked: !!acc.add_shorts_tag }) : null;
 
-    accInputs.set(acc.id, { name: nameIn, client_id: idIn, client_secret: secIn, privacy: privIn, add_shorts_tag: shortsIn });
+    accInputs.set(acc.id, { name: nameIn, client_id: idIn, client_secret: secIn, privacy: privIn, scope: scopeIn, add_shorts_tag: shortsIn });
 
     const connectBtn = h("button", { class: "btn sm primary", onclick: guard(async () => {
       await saveAccountCard(acc.id, true);
@@ -1352,13 +1379,15 @@ function SettingsPage(params) {
         h("div", { class: "row" },
           chip(isYT ? "YouTube" : "TikTok", isYT ? "yt" : "tt"),
           h("strong", {}, acc.name),
+          acc.username ? chip("@" + acc.username, "ok") : null,
           acc.connected ? chip("Connected", "ok") : chip("Not connected", "warn")),
         h("div", { class: "row" }, connectBtn, saveBtn, disBtn, delBtn)),
       h("div", { class: "fields" },
-        h("label", { class: "field" }, h("span", { class: "lbl" }, "Account / API Name"), nameIn),
-        h("label", { class: "field" }, h("span", { class: "lbl" }, isYT ? "Google OAuth Client ID" : "TikTok Client Key"), idIn),
-        h("label", { class: "field" }, h("span", { class: "lbl" }, isYT ? "Google OAuth Client Secret" : "TikTok Client Secret"), secIn),
-        h("label", { class: "field" }, h("span", { class: "lbl" }, "Default visibility"), privIn),
+        h("label", { class: "field" }, h("span", { class: "lbl" }, isYT ? "Account / API Name" : "Account Name / Label"), nameIn),
+        isYT ? h("label", { class: "field" }, h("span", { class: "lbl" }, "Google OAuth Client ID"), idIn) : null,
+        isYT ? h("label", { class: "field" }, h("span", { class: "lbl" }, "Google OAuth Client Secret"), secIn) : null,
+        h("label", { class: "field" }, h("span", { class: "lbl" }, "Default posting mode / privacy"), privIn),
+        !isYT ? h("label", { class: "field" }, h("span", { class: "lbl" }, "OAuth Scope"), scopeIn) : null,
         isYT ? h("label", { class: "check", style: { alignSelf: "center", marginTop: "18px" } }, shortsIn, h("span", { style: { fontWeight: 650 } }, "Add #Shorts to vertical clips")) : null));
   }
 
@@ -1437,24 +1466,74 @@ function SettingsPage(params) {
   function tiktokPanel() {
     const ttAccs = accounts.filter((a) => a.platform === "tiktok");
     const redUri = redirectUris.tiktok || (location.origin + "/api/tiktok/callback");
-    return h("section", { class: "panel" },
-      h("header", { class: "stack", style: { gap: "10px", alignItems: "flex-start" } },
+
+    const devKeyIn = h("input", { type: "text", value: settings.tiktok_client_key || "", placeholder: "e.g. awxxxxxxxxxxxxxx" });
+    const devSecIn = h("input", { type: "password", autocomplete: "off", placeholder: settings.tiktok_client_secret_set ? "Saved. Enter new secret to replace." : "Enter Sandbox Client Secret" });
+
+    const saveDevBtn = h("button", { class: "btn sm", onclick: guard(async () => {
+      const patch = { tiktok_client_key: devKeyIn.value.trim() };
+      if (devSecIn.value) patch.tiktok_client_secret = devSecIn.value.trim();
+      await api("/settings", { method: "POST", json: patch });
+      toast("TikTok Developer App credentials saved.");
+      await load();
+    }) }, "Save App Credentials");
+
+    const startConnect = guard(async () => {
+      if (!settings.tiktok_client_key && !devKeyIn.value.trim()) {
+        toast("Enter and save your TikTok Sandbox Client Key and Secret above first.", true);
+        return;
+      }
+      if (devSecIn.value || devKeyIn.value.trim() !== (settings.tiktok_client_key || "")) {
+        const patch = { tiktok_client_key: devKeyIn.value.trim() };
+        if (devSecIn.value) patch.tiktok_client_secret = devSecIn.value.trim();
+        await api("/settings", { method: "POST", json: patch });
+      }
+      const r = await api("/tiktok/connect");
+      location.href = r.url;
+    });
+
+    const connectNewBtn = h("button", { class: "btn sm primary", onclick: startConnect }, "+ Connect TikTok Account");
+
+    const credsBox = h("div", { class: "creds-box" },
+      h("div", { class: "creds-box-head" },
         h("div", {},
-          h("h2", {}, `TikTok Accounts & APIs (${ttAccs.length})`),
-          h("p", { class: "hint", style: { margin: 0 } }, "Connect one or multiple named TikTok accounts via TikTok Content Posting API v2.")),
-        h("button", { class: "btn sm primary", onclick: () => openAddAccountModal("tiktok") }, "+ Add TikTok Account / API")),
+          h("strong", {}, "1. TikTok Developer App Credentials (Shared for all accounts)"),
+          h("p", { class: "hint", style: { margin: "2px 0 0" } }, "You only need 1 TikTok Developer App (Sandbox). Enter your Client Key and Secret here once — all your TikTok accounts will share these credentials.")),
+        saveDevBtn),
+      h("div", { class: "fields" },
+        h("label", { class: "field" }, h("span", { class: "lbl" }, "TikTok Sandbox Client Key"), devKeyIn),
+        h("label", { class: "field" }, h("span", { class: "lbl" }, "TikTok Sandbox Client Secret"), devSecIn)),
+      h("div", { class: "row", style: { alignItems: "center", gap: "8px", background: "var(--bg)", padding: "8px 12px", borderRadius: "6px", border: "1px solid var(--line)" } },
+        h("span", { class: "small muted", style: { flexShrink: 0 } }, "Redirect URI for TikTok Portal:"),
+        h("code", { style: { flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" } }, redUri),
+        h("button", { class: "btn sm", onclick: () => { navigator.clipboard && navigator.clipboard.writeText(redUri); toast("Copied Redirect URI."); } }, "Copy"))
+    );
+
+    return h("section", { class: "panel" },
+      credsBox,
+      h("header", { class: "stack", style: { gap: "10px", alignItems: "flex-start", marginTop: "12px" } },
+        h("div", { class: "row between", style: { width: "100%", alignItems: "center" } },
+          h("div", {},
+            h("h2", { style: { margin: 0 } }, `2. Connected TikTok Accounts (${ttAccs.length})`),
+            h("p", { class: "hint", style: { margin: 0 } }, "Connect up to 10 accounts in TikTok Sandbox. Tap '+ Connect TikTok Account' to log in.")),
+          connectNewBtn)),
       ttAccs.length
         ? h("div", { class: "acc-list" }, ttAccs.map(renderAccountCard))
-        : h("div", { class: "empty", style: { margin: "12px 0", padding: "18px" } }, "No TikTok API accounts added yet. Click '+ Add TikTok Account / API' to add your first account."),
-      h("div", { style: { marginBottom: "12px" } },
-        h("button", { class: "btn sm", onclick: () => openAddAccountModal("tiktok") }, "+ Add Another TikTok Account / API")),
-      h("details", {},
-        h("summary", { style: { cursor: "pointer", fontWeight: 650 } }, "How to configure TikTok Developer App"),
+        : h("div", { class: "empty", style: { margin: "12px 0", padding: "18px" } }, "No TikTok accounts connected yet. Click '+ Connect TikTok Account' above to link your first account."),
+      ttAccs.length ? h("div", { style: { marginBottom: "12px" } },
+        h("button", { class: "btn sm", onclick: startConnect }, "+ Connect Another TikTok Account")) : null,
+      h("details", { style: { marginTop: "14px" } },
+        h("summary", { style: { cursor: "pointer", fontWeight: 650 } }, "How to configure TikTok Developer Sandbox & Multiple Accounts"),
         h("ol", { class: "small" },
-          h("li", {}, "Log into ", h("strong", {}, "developers.tiktok.com"), " and create an app with Content Posting API v2."),
-          h("li", {}, "Under Redirect Domains / URIs, add:"),
+          h("li", {}, "Log into ", h("strong", {}, "developers.tiktok.com"), " and open your app. Click the ", h("strong", {}, "Sandbox"), " tab next to Production (no app review or audit needed)."),
+          h("li", {}, "Under Products, add ", h("strong", {}, "Login Kit"), " and ", h("strong", {}, "Content Posting API"), ". Leave ", h("strong", {}, "Upload to TikTok"), " enabled (this is Inbox Draft mode)."),
+          h("li", {}, "Under Login Kit, set the exact Redirect URI (must be HTTPS, e.g. via Cloudflare Tunnel or your domain):"),
           h("li", { style: { listStyle: "none" } }, h("div", { class: "row" }, h("code", {}, redUri), h("button", { class: "btn sm", onclick: () => { navigator.clipboard && navigator.clipboard.writeText(redUri); toast("Copied."); } }, "Copy"))),
-          h("li", {}, "Click '+ Add TikTok Account / API' above, give it a name, paste the Client Key and Client Secret, and click Connect TikTok.")))
+          h("li", {}, "Under ", h("strong", {}, "Roles & Access (Target Users)"), " in the Sandbox, add each TikTok account you own (up to 10 accounts). Log into each account on TikTok to accept the invite."),
+          h("li", {}, "Copy your ", h("strong", {}, "Sandbox Client Key"), " and ", h("strong", {}, "Sandbox Client Secret"), " and save them in box #1 above. Exactly 1 set of keys covers ALL your accounts!"),
+          h("li", {}, "Click ", h("strong", {}, "'+ Connect TikTok Account'"), " above. Authorize on TikTok. ClipForge connects your account and fetches its @handle automatically!"),
+          h("li", {}, "To add another account: Switch accounts in your browser or phone, click '+ Connect Another TikTok Account', and authorize."),
+          h("li", {}, "Why Inbox Mode? Unaudited apps cannot post public videos directly. Inbox mode delivers the video as an editable draft directly into your TikTok app inbox, allowing you to tap Post and publish publicly with zero audit hurdles!")))
     );
   }
 
