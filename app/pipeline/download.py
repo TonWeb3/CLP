@@ -4,6 +4,8 @@ from __future__ import annotations
 import glob
 from pathlib import Path
 
+from . import media
+
 
 class DownloadError(RuntimeError):
     pass
@@ -45,6 +47,8 @@ def download(url: str, dest_dir: Path, cfg: dict, progress_cb, cancel_check) -> 
         "restrictfilenames": True,
         "concurrent_fragment_downloads": 4,
     }
+    if media.have_ffmpeg():
+        opts["ffmpeg_location"] = media.FFMPEG
     cookies = (cfg.get("cookies") or "").strip()
     if cookies:
         cf = dest_dir / "cookies.txt"

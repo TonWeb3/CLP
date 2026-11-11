@@ -193,7 +193,7 @@ def _run_render(clip_id: int) -> None:
                   width=res["width"], height=res["height"], size=res["size"], error=None)
     except Exception as e:  # noqa: BLE001
         log.error("render failed for clip %s:\n%s", clip_id, traceback.format_exc())
-        db.update("clips", clip_id, status="failed", error=str(e)[:600])
+        db.update("clips", clip_id, status="failed", error=str(e)[:2000])
 
 
 # --------------------------------------------------------------------------

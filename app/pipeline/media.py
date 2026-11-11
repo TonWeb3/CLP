@@ -7,12 +7,31 @@ import subprocess
 import wave
 from pathlib import Path
 
-FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
-FFPROBE = shutil.which("ffprobe") or "ffprobe"
+def _find_binary(name: str) -> str:
+    found = shutil.which(name)
+    if found:
+        return found
+    candidates = [
+        Path(r"C:\Program Files\Anvsoft\Any Video Converter\resources\com.anvsoft.avc\native") / f"{name}.exe",
+        Path(r"C:\ffmpeg\bin") / f"{name}.exe",
+        Path(r"C:\Program Files\ffmpeg\bin") / f"{name}.exe",
+        Path(r"C:\ProgramData\chocolatey\bin") / f"{name}.exe",
+        Path.home() / f"scoop/apps/ffmpeg/current/bin/{name}.exe",
+        Path.home() / f"AppData/Local/Microsoft/WinGet/Links/{name}.exe",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    return name
+
+
+FFMPEG = _find_binary("ffmpeg")
+FFPROBE = _find_binary("ffprobe")
 
 
 def have_ffmpeg() -> bool:
-    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+    return (shutil.which(FFMPEG) is not None or Path(FFMPEG).is_file()) and \
+           (shutil.which(FFPROBE) is not None or Path(FFPROBE).is_file())
 
 
 def probe(path: str | Path) -> dict:

@@ -187,7 +187,11 @@ def finish(state: str, code: str, redirect_uri: str) -> int | None:
     token_data = data.get("data") if (isinstance(data.get("data"), dict) and data["data"].get("access_token")) else data
     access_token = token_data.get("access_token") if isinstance(token_data, dict) else None
 
-    if resp.status_code != 200 or data.get("error") or not access_token:
+    err_val = data.get("error")
+    err_code = err_val.get("code") if isinstance(err_val, dict) else err_val
+    has_error = err_code not in ("ok", 0, None, "")
+
+    if resp.status_code != 200 or has_error or not access_token:
         err = data.get("error_description") or data.get("message") or resp.text[:300]
         raise TikTokError(f"TikTok authentication failed: {err}")
 

@@ -823,8 +823,10 @@ function PublisherPage() {
       ["interval", "Space out evenly (e.g. 1 clip every few hours)"]
     ].map(([v, t]) => h("option", { value: v }, t)));
 
-    // Default time is in 10 minutes
-    const nowLocal = new Date(Date.now() + 10 * 60 * 1000).toISOString().slice(0, 16);
+    // Default time is in 10 minutes in local timezone
+    const dtNow = new Date(Date.now() + 10 * 60 * 1000);
+    const pad2 = (n) => String(n).padStart(2, "0");
+    const nowLocal = `${dtNow.getFullYear()}-${pad2(dtNow.getMonth() + 1)}-${pad2(dtNow.getDate())}T${pad2(dtNow.getHours())}:${pad2(dtNow.getMinutes())}`;
     const timeInput = h("input", { type: "datetime-local", value: nowLocal });
     const intervalInput = h("input", { type: "number", value: 3, min: 1, max: 72 });
     const timeWrap = h("div", { class: "stack", style: { marginTop: "8px" } },
@@ -1226,6 +1228,7 @@ function SettingsPage(params) {
 
   function readValue(f) {
     const i = inputs[f.key];
+    if (!i) return settings[f.key];
     if (f.type === "bool") return i.checked;
     if (f.type === "number" || f.numeric) return Number(i.value);
     return i.value;

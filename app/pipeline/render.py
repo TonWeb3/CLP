@@ -402,9 +402,14 @@ def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w
     pts = [(tt, min(max(c - half, 0), src_w - crop_w)) for tt, c in path]
     eps = 4.0
     simp = _rdp(pts, eps)
-    while len(simp) > 40:
-        eps *= 1.6
+    while len(simp) > 16:
+        eps *= 1.4
         simp = _rdp(pts, eps)
+    if simp:
+        simp[0] = (0.0, simp[0][1])
+        clip_dur = end - start
+        if simp[-1][0] < clip_dur:
+            simp.append((clip_dur, simp[-1][1]))
     return simp
 
 
@@ -477,7 +482,16 @@ def face_paths_split(src: str, start: float, end: float, src_w: int, src_h: int,
             filled.append(last)
         half = crop_w / 2
         pts = [(tt, min(max(c - half, 0), src_w - crop_w)) for (tt, _), c in zip(raw, filled)]
-        simp = _rdp(pts, 4.0)
+        eps = 4.0
+        simp = _rdp(pts, eps)
+        while len(simp) > 16:
+            eps *= 1.4
+            simp = _rdp(pts, eps)
+        if simp:
+            simp[0] = (0.0, simp[0][1])
+            clip_dur = end - start
+            if simp[-1][0] < clip_dur:
+                simp.append((clip_dur, simp[-1][1]))
         return simp
 
     return process_raw(raw_left), process_raw(raw_right)
@@ -507,8 +521,10 @@ def _subs_filter(has_subs: bool, in_label: str, out_label: str) -> str:
         return f"[{in_label}]null[{out_label}]"
     fonts = config.DATA_DIR / "fonts"
     opt = ""
-    if fonts.is_dir() and any(fonts.iterdir()):
-        opt = f":fontsdir={_esc(str(fonts))}"
+    font_files = [f for f in fonts.iterdir() if f.is_file() and f.suffix.lower() in (".ttf", ".otf", ".woff", ".woff2")] if fonts.is_dir() else []
+    if font_files:
+        esc_dir = _esc(str(fonts).replace("\\", "/"))
+        opt = f":fontsdir='{esc_dir}'"
     return f"[{in_label}]ass=subs.ass{opt}[{out_label}]"
 
 
@@ -528,10 +544,11 @@ def build_graph(mode: str, aspect: str, src_w: int, src_h: int, tw: int, th: int
         split_crop_w = min(src_w, split_crop_w - (split_crop_w % 2))
         cw = split_crop_w
         ch = src_h - (src_h % 2)
+        max_split_x = max(0, src_w - cw)
 
         p_left, p_right = split_paths if split_paths else (None, None)
-        x_top = _lerp_expr(p_left) if p_left else f"{max(0, (src_w * 0.25 - cw / 2)):.1f}"
-        x_bot = _lerp_expr(p_right) if p_right else f"{min(src_w - cw, (src_w * 0.75 - cw / 2)):.1f}"
+        x_top = f"min(max({_lerp_expr(p_left)},0),{max_split_x})" if p_left else f"{max(0, min(max_split_x, int(round(src_w * 0.25 - cw / 2))))}"
+        x_bot = f"min(max({_lerp_expr(p_right)},0),{max_split_x})" if p_right else f"{max(0, min(max_split_x, int(round(src_w * 0.75 - cw / 2))))}"
 
         base = (
             f"[0:v]split=2[sp1][sp2];"
@@ -548,10 +565,11 @@ def build_graph(mode: str, aspect: str, src_w: int, src_h: int, tw: int, th: int
     else:
         cw = crop_w - (crop_w % 2)
         ch = src_h - (src_h % 2)
+        max_x = max(0, src_w - cw)
         if mode == "face" and path:
-            x = _lerp_expr(path)
+            x = f"min(max({_lerp_expr(path)},0),{max_x})"
         else:
-            x = f"{(src_w - cw) / 2:.1f}"
+            x = f"{max_x // 2}"
         base = f"[0:v]crop={cw}:{ch}:x='{x}':y=0,scale={tw}:{th}:flags=lanczos,setsar=1[v_raw]"
 
     # Synchronized dead-air silence removal (applied after face-tracking crop so crop uses original t)
@@ -669,7 +687,7 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
                 sel_expr = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in keep_segs)
                 af_chain.extend([f"aselect='{sel_expr}'", "asetpts=N/SR/TB"])
             if clean_audio:
-                af_chain.extend(["highpass=f=75", "lowpass=f=12000", "afftdn=nf=-25dB"])
+                af_chain.extend(["highpass=f=75", "lowpass=f=12000", "afftdn=nf=-25"])
             if norm_audio:
                 af_chain.append("loudnorm=I=-14:LRA=11:TP=-1.5")
 
@@ -697,7 +715,7 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
                         pass
             code = proc.wait()
         if code != 0:
-            err = log_path.read_text("utf-8", "replace")[-600:]
+            err = log_path.read_text("utf-8", "replace")[-2500:]
             tmp_out.unlink(missing_ok=True)
             raise RuntimeError("ffmpeg failed: " + err.strip())
 
