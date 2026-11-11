@@ -1237,13 +1237,13 @@ function SettingsPage(params) {
     const ref = accInputs.get(accId);
     if (!ref) return;
     const patch = {
-      name: ref.name.value.trim(),
-      client_id: ref.client_id.value.trim(),
-      privacy: ref.privacy.value,
+      name: ref.name ? ref.name.value.trim() : "",
+      privacy: ref.privacy ? ref.privacy.value : "INBOX",
     };
-    if (ref.client_secret.value) patch.client_secret = ref.client_secret.value.trim();
+    if (ref.client_id) patch.client_id = ref.client_id.value.trim();
+    if (ref.client_secret && ref.client_secret.value) patch.client_secret = ref.client_secret.value.trim();
     if (ref.add_shorts_tag) patch.add_shorts_tag = ref.add_shorts_tag.checked;
-    if (ref.scope) patch.scope = ref.scope.value;
+    if (ref.scope && ref.scope.value !== undefined) patch.scope = ref.scope.value;
     await api(`/accounts/${accId}`, { method: "PATCH", json: patch });
     if (!silent) toast(`Saved "${patch.name}".`);
   }

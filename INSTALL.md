@@ -89,7 +89,7 @@ python main.py
 ```
 *(or `./start.sh`)*
 
-Then open `http://your-server-ip:8000` in your browser.
+Then open `http://your-server-ip:8120` in your browser.
 
 ---
 
@@ -101,7 +101,7 @@ ClipForge includes a `Dockerfile` for containerized setups:
 docker build -t clipforge .
 
 # Run the container (persisting data in /data)
-docker run -d -p 8000:8000 -v clipforge_data:/data --name clipforge clipforge
+docker run -d -p 8120:8120 -v clipforge_data:/data --name clipforge clipforge
 ```
 
 ---
@@ -109,5 +109,5 @@ docker run -d -p 8000:8000 -v clipforge_data:/data --name clipforge clipforge
 ### 7. Open in Browser
 
 Open your browser and navigate to:
-**`http://localhost:8000`**
+**`http://localhost:8120`**
 
