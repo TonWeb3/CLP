@@ -147,8 +147,9 @@ def get_creator_info(cfg_or_acc: dict | int) -> dict:
         r = requests.post(TIKTOK_CREATOR_INFO_URL, headers=headers, json={}, timeout=15)
         if r.status_code == 200:
             res = r.json()
-            if res.get("error", {}).get("code") == "ok":
-                return res.get("data", {})
+            err_code = res.get("error", {}).get("code") if isinstance(res.get("error"), dict) else res.get("error")
+            if err_code in ("ok", 0, None) or not res.get("error"):
+                return res.get("data") if isinstance(res.get("data"), dict) else res
         log.warning("TikTok creator_info query returned %s: %s", r.status_code, r.text[:200])
     except Exception as e:
         log.warning("TikTok creator_info query failed: %s", e)
@@ -183,11 +184,13 @@ def finish(state: str, code: str, redirect_uri: str) -> int | None:
         timeout=30,
     )
     data = resp.json()
-    if resp.status_code != 200 or data.get("error") or not data.get("data", {}).get("access_token"):
+    token_data = data.get("data") if (isinstance(data.get("data"), dict) and data["data"].get("access_token")) else data
+    access_token = token_data.get("access_token") if isinstance(token_data, dict) else None
+
+    if resp.status_code != 200 or data.get("error") or not access_token:
         err = data.get("error_description") or data.get("message") or resp.text[:300]
         raise TikTokError(f"TikTok authentication failed: {err}")
 
-    token_data = data["data"]
     token_data["created_at"] = time.time()
 
     if account_id is None:
@@ -279,13 +282,14 @@ def _get_access_token(acc: dict) -> str:
                 timeout=30,
             )
             refresh_data = resp.json()
-            if resp.status_code == 200 and refresh_data.get("data", {}).get("access_token"):
-                data.update(refresh_data["data"])
+            refreshed = refresh_data.get("data") if (isinstance(refresh_data.get("data"), dict) and refresh_data["data"].get("access_token")) else refresh_data
+            if resp.status_code == 200 and isinstance(refreshed, dict) and refreshed.get("access_token"):
+                data.update(refreshed)
                 data["created_at"] = time.time()
                 tpath.write_text(json.dumps(data, indent=2), "utf-8")
                 token = data["access_token"]
             else:
-                log.warning("TikTok token refresh failed; trying existing access token")
+                log.warning("TikTok token refresh failed; trying existing access token: %s", refresh_data)
 
         if not token:
             name = acc.get("name") or "TikTok"
