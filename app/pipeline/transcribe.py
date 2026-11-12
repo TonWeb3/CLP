@@ -68,23 +68,50 @@ def transcribe(audio_path: str, cfg: dict, duration: float, progress_cb) -> tupl
 SENT_END = (".", "?", "!", "…", "。", "？", "！", "؟")
 TRAILING_PUNCT = "\"'”’»)}]> "
 
+ABBREVIATIONS = {
+    "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.", "vs.", "etc.",
+    "e.g.", "i.e.", "u.s.", "u.k.", "approx.", "est.", "inc.", "ltd.", "corp.", "co."
+}
+
+DANGLING_CONNECTORS = {
+    "and", "but", "or", "nor", "for", "yet", "so", "because", "although", "though", "while",
+    "if", "when", "whenever", "where", "wherever", "whether", "as", "since", "that", "which",
+    "who", "whom", "whose", "what", "whatever", "whoever", "than", "to", "with", "into", "onto",
+    "about", "like", "including", "such", "then",
+}
+
 
 def build_sentences(words: list[dict]) -> list[dict]:
-    """Group words into coherent sentences with natural spoken boundaries."""
+    """Group words into coherent sentences with natural spoken boundaries,
+    protecting dramatic pauses and preventing broken sentence fragments."""
     sentences: list[dict] = []
     start_idx = 0
     n = len(words)
     for i, w in enumerate(words):
         gap = (words[i + 1]["s"] - w["e"]) if i + 1 < n else 99.0
         clean_word = (w.get("w") or "").rstrip(TRAILING_PUNCT)
-        ended = any(clean_word.endswith(p) for p in SENT_END)
+        low_word = clean_word.lower()
+
+        # Check if punctuation is genuine or an abbreviation
+        is_abbrev = low_word in ABBREVIATIONS
+        ended = any(clean_word.endswith(p) for p in SENT_END) and not is_abbrev
+
+        # Check if word is a dangling connector (e.g. "and", "because")
+        bare_word = low_word.strip(".,!?:;\"'()[]{}-")
+        is_connector = bare_word in DANGLING_CONNECTORS
+
         cur_dur = w["e"] - words[start_idx]["s"]
         word_count = i - start_idx + 1
 
-        clause_break = cur_dur > 8.0 and gap > 0.7 and clean_word.endswith((",", ";", ":", "—", "-"))
-        significant_pause = gap > 1.2
-        extended_pause = cur_dur > 14.0 and gap > 0.85
-        too_long = cur_dur > 25.0 or word_count >= 60
+        clause_break = cur_dur > 8.0 and gap > 0.7 and clean_word.endswith((",", ";", ":", "—", "-")) and not is_connector
+        # Don't split dramatic pauses on connectors unless speech is excessively long
+        significant_pause = gap > 1.4 and not is_connector
+        extended_pause = cur_dur > 14.0 and gap > 0.95
+        too_long = cur_dur > 26.0 or word_count >= 65
+
+        # If ended with true punctuation, but next word is lowercase, might be a mid-thought comma hallucinated as period
+        if ended and i + 1 < n and not (gap > 0.75 or words[i + 1].get("w", "").strip()[:1].isupper()):
+            ended = False
 
         if ended or significant_pause or extended_pause or clause_break or too_long or i == n - 1:
             seg = words[start_idx:i + 1]

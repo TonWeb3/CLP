@@ -415,16 +415,21 @@ def upload(cfg_or_acc: dict | int, video_path: str | Path, title: str, privacy: 
     # In inbox mode: SEND_TO_USER_INBOX indicates the draft was delivered to the user's TikTok app inbox.
     # In direct post mode: PUBLISH_COMPLETE indicates the post is live.
     progress_cb(0.85)
-    for attempt in range(12):
-        time.sleep(2)
+    last_status = None
+    for attempt in range(30):
+        time.sleep(2 if attempt < 10 else 3)
         try:
             status_r = requests.post(TIKTOK_STATUS_URL, headers=headers, json={"publish_id": publish_id}, timeout=15)
             s_data = status_r.json().get("data", {})
             st = s_data.get("status")
+            if st:
+                last_status = st
             if is_inbox and st in ("SEND_TO_USER_INBOX", "PUBLISH_COMPLETE"):
+                log.info("TikTok inbox draft delivered for publish_id %s (status: %s)", publish_id, st)
                 progress_cb(1.0)
                 return publish_id
             if not is_inbox and st == "PUBLISH_COMPLETE":
+                log.info("TikTok direct post published successfully for publish_id %s", publish_id)
                 progress_cb(1.0)
                 return publish_id
             if st == "FAILED":
@@ -432,11 +437,12 @@ def upload(cfg_or_acc: dict | int, video_path: str | Path, title: str, privacy: 
                 if "unaudited" in fail_reason.lower():
                     fail_reason += " (Use 'INBOX' draft mode for unaudited / sandbox apps)"
                 raise TikTokError(f"TikTok publish failed: {fail_reason}")
-            progress_cb(min(0.98, 0.85 + 0.01 * (attempt + 1)))
+            progress_cb(min(0.98, 0.85 + 0.004 * (attempt + 1)))
         except TikTokError:
             raise
         except Exception as e:
             log.warning("TikTok status check attempt %d failed: %s", attempt, e)
 
+    log.info("TikTok publish finished status loop for publish_id %s (last status: %s)", publish_id, last_status)
     progress_cb(1.0)
     return publish_id

@@ -63,6 +63,27 @@ def _match_emoji(clean_word: str) -> str:
     return EMOJI_KEYWORDS.get(w, "")
 
 
+POWER_COLORS: dict[str, str] = {
+    # Wealth / Money / Growth (Vibrant Gold & Lime)
+    "money": "&H00D7FF&", "cash": "&H00D7FF&", "dollar": "&H00D7FF&", "dollars": "&H00D7FF&",
+    "million": "&H00D7FF&", "billion": "&H00D7FF&", "wealth": "&H00D7FF&", "rich": "&H00D7FF&",
+    "profit": "&H39FF14&", "win": "&H39FF14&", "success": "&H39FF14&", "scale": "&H39FF14&",
+    # Danger / Negative / Warning / Pain (Vibrant Red)
+    "never": "&H0033FF&", "stop": "&H0033FF&", "wrong": "&H0033FF&", "fail": "&H0033FF&",
+    "fake": "&H0033FF&", "lie": "&H0033FF&", "scam": "&H0033FF&", "destroy": "&H0033FF&",
+    "worst": "&H0033FF&", "hate": "&H0033FF&", "danger": "&H0033FF&", "warning": "&H0033FF&",
+    "mistake": "&H0033FF&", "broke": "&H0033FF&", "dead": "&H0033FF&", "death": "&H0033FF&",
+    # Truth / Secret / Hack (Electric Cyan)
+    "truth": "&H00F0FF&", "secret": "&H00F0FF&", "hack": "&H00F0FF&", "cheat": "&H00F0FF&",
+    "trick": "&H00F0FF&", "real": "&H00F0FF&", "key": "&H00F0FF&", "rule": "&H00F0FF&",
+}
+
+
+def _power_word_color(clean_word: str) -> str | None:
+    w = clean_word.lower().strip(".,!?:;\"'()[]{}- ")
+    return POWER_COLORS.get(w)
+
+
 def target_size(aspect: str, out_width: int) -> tuple[int, int]:
     w, h = ASPECTS.get(aspect, ASPECTS["9:16"])
     if aspect == "16:9":
@@ -297,7 +318,14 @@ def build_ass(words: list[dict], clip_start: float, clip_end: float, W: int, H: 
             parts = []
             for j, t in enumerate(texts):
                 if j == k:
-                    parts.append(f"{{\\1c{hi}\\fscx{scale_pop}\\fscy{scale_pop}}}{t}{{\\1c{primary}\\fscx100\\fscy100}}")
+                    # Power word dynamic color accenting
+                    active_col = _power_word_color(g[k]["w"]) or hi
+                    pop_start = scale_pop + 14
+                    # Kinetic elastic bounce transform on active spoken word
+                    parts.append(
+                        f"{{\\1c{active_col}\\t(0,90,\\fscx{pop_start}\\fscy{pop_start})\\t(90,200,\\fscx{scale_pop}\\fscy{scale_pop})}}{t}"
+                        f"{{\\1c{primary}\\fscx100\\fscy100}}"
+                    )
                 else:
                     parts.append(t)
             line_text = " ".join(parts) + (group_emoji if k == len(g) - 1 else "")
@@ -324,20 +352,96 @@ def _rdp(points: list[tuple[float, float]], eps: float) -> list[tuple[float, flo
     return [points[0], points[-1]]
 
 
+def _load_cascades(cv2):
+    """Load frontal face, profile face, and upper body cascades from bundled folder or cv2 fallback."""
+    cascade_dir = Path(__file__).parent / "cascades"
+    cv_data = getattr(getattr(cv2, "data", None), "haarcascades", "") or ""
+
+    def get_casc(name: str):
+        local_p = cascade_dir / name
+        if local_p.is_file():
+            c = cv2.CascadeClassifier(str(local_p))
+            if not c.empty():
+                return c
+        if cv_data:
+            sys_p = Path(cv_data) / name
+            if sys_p.is_file():
+                c = cv2.CascadeClassifier(str(sys_p))
+                if not c.empty():
+                    return c
+        return None
+
+    return get_casc("haarcascade_frontalface_default.xml"), \
+           get_casc("haarcascade_profileface.xml"), \
+           get_casc("haarcascade_upperbody.xml")
+
+
+def _detect_speaker_cands(cv2, gray, scale, frontal, profile, body) -> list[tuple[float, float, float]]:
+    """Detect frontal faces, profile faces (both left and right via horizontal flip),
+    and upper bodies (when head is turned/tilted). Returns [(cx, cy, area)].
+    """
+    cands: list[tuple[float, float, float]] = []
+
+    # 1. Frontal face detection
+    if frontal is not None:
+        f_faces = frontal.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5,
+            minSize=(max(24, int(32 * scale)), max(24, int(32 * scale)))
+        )
+        for (x, y, w, h) in f_faces:
+            cands.append(((x + w / 2) / scale, (y + h / 2) / scale, float(w * h)))
+
+    # 2. Profile face detection (left-facing)
+    if profile is not None:
+        p_faces = profile.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=4,
+            minSize=(max(24, int(32 * scale)), max(24, int(32 * scale)))
+        )
+        for (x, y, w, h) in p_faces:
+            cands.append(((x + w / 2) / scale, (y + h / 2) / scale, float(w * h)))
+
+        # 3. Profile face detection (right-facing via horizontal flip)
+        flipped = cv2.flip(gray, 1)
+        p_faces_flip = profile.detectMultiScale(
+            flipped, scaleFactor=1.1, minNeighbors=4,
+            minSize=(max(24, int(32 * scale)), max(24, int(32 * scale)))
+        )
+        img_w = gray.shape[1]
+        for (x, y, w, h) in p_faces_flip:
+            orig_x = img_w - (x + w)
+            cands.append(((orig_x + w / 2) / scale, (y + h / 2) / scale, float(w * h)))
+
+    # 4. Upper body detection (head + shoulders when speaker looks down or faces away)
+    if not cands and body is not None:
+        bodies = body.detectMultiScale(
+            gray, scaleFactor=1.15, minNeighbors=3,
+            minSize=(max(45, int(60 * scale)), max(45, int(60 * scale)))
+        )
+        for (x, y, w, h) in bodies:
+            cands.append(((x + w / 2) / scale, (y + h * 0.35) / scale, float(w * h * 0.4)))
+
+    return cands
+
+
 def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w: int,
               samples_per_sec: float = 4.0) -> list[tuple[float, float]] | None:
-    """Return [(t, crop_x)] with t relative to the clip start, or None if no face was found."""
+    """Return [(t, crop_x)] with t relative to the clip start, or None if no speaker was found.
+    Equipped with Active Speaker Auto-Cameraman: when multiple speakers are present (e.g. in podcasts
+    or interview setups), detects mouth motion energy and fluidly pans to whoever is talking.
+    """
     try:
         import cv2
     except ImportError:
         return None
-    cascade_path = getattr(getattr(cv2, "data", None), "haarcascades", "") + "haarcascade_frontalface_default.xml"
-    cascade = cv2.CascadeClassifier(cascade_path)
-    if cascade.empty():
+
+    frontal, profile, body = _load_cascades(cv2)
+    if not frontal and not profile and not body:
         return None
+
     cap = cv2.VideoCapture(src)
     if not cap.isOpened():
         return None
+
     det_w = 640
     scale = det_w / src_w if src_w > det_w else 1.0
     raw: list[tuple[float, float | None]] = []
@@ -347,6 +451,16 @@ def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w
     frame_interval = max(1, int(round(fps / samples_per_sec)))
     cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, start * 1000))
     prev_cx = None
+    lost_count = 0
+    mid_x = src_w / 2
+    prev_gray = None
+
+    # Active Speaker Motion state
+    ema_l_motion = 0.0
+    ema_r_motion = 0.0
+    active_side = None
+    side_switch_hold = 0
+
     try:
         while t < end:
             ok, frame = cap.read()
@@ -354,14 +468,72 @@ def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w
                 break
             small = cv2.resize(frame, None, fx=scale, fy=scale) if scale != 1.0 else frame
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6,
-                                             minSize=(max(30, int(40 * scale)), max(30, int(40 * scale))))
+            cands = _detect_speaker_cands(cv2, gray, scale, frontal, profile, body)
             cx = None
-            if len(faces):
-                cands = [((x + w / 2) / scale, float(w * h)) for (x, y, w, h) in faces]
-                near = [c for c in cands if prev_cx is not None and abs(c[0] - prev_cx) < crop_w * 0.45]
-                cx = min(near, key=lambda c: abs(c[0] - prev_cx))[0] if near else max(cands, key=lambda c: c[1])[0]
-                prev_cx = cx
+            if cands:
+                left_cands = [c for c in cands if c[0] < mid_x]
+                right_cands = [c for c in cands if c[0] >= mid_x]
+
+                if left_cands and right_cands:
+                    best_l = max(left_cands, key=lambda c: c[2])
+                    best_r = max(right_cands, key=lambda c: c[2])
+
+                    m_l, m_r = 0.0, 0.0
+                    if prev_gray is not None:
+                        for spk, (ccx, ccy, _) in (("l", best_l), ("r", best_r)):
+                            sx, sy = int(ccx * scale), int(ccy * scale)
+                            my = max(0, min(gray.shape[0] - 15, sy + 4))
+                            mx = max(0, min(gray.shape[1] - 24, sx - 12))
+                            diff = float(cv2.absdiff(gray[my:my+15, mx:mx+24], prev_gray[my:my+15, mx:mx+24]).mean())
+                            if spk == "l":
+                                m_l = diff
+                            else:
+                                m_r = diff
+
+                    ema_l_motion = 0.35 * m_l + 0.65 * ema_l_motion
+                    ema_r_motion = 0.35 * m_r + 0.65 * ema_r_motion
+
+                    if ema_l_motion > ema_r_motion * 1.30:
+                        desired_side = "left"
+                    elif ema_r_motion > ema_l_motion * 1.30:
+                        desired_side = "right"
+                    else:
+                        desired_side = active_side or "left"
+
+                    if desired_side != active_side:
+                        side_switch_hold += 1
+                        if side_switch_hold >= 5 or active_side is None:
+                            active_side = desired_side
+                            side_switch_hold = 0
+                    else:
+                        side_switch_hold = 0
+
+                    chosen = best_l if active_side == "left" else best_r
+                    cx = chosen[0]
+                    prev_cx = cx
+                    lost_count = 0
+                else:
+                    if prev_cx is None:
+                        cx = max(cands, key=lambda c: c[2])[0]
+                        prev_cx = cx
+                        lost_count = 0
+                    else:
+                        near = [c for c in cands if abs(c[0] - prev_cx) < crop_w * 0.6]
+                        if near:
+                            cx = min(near, key=lambda c: abs(c[0] - prev_cx))[0]
+                            prev_cx = cx
+                            lost_count = 0
+                        else:
+                            lost_count += 1
+                            if lost_count >= 5:  # ~1.25s sustained absence -> genuine shot/speaker cut
+                                cx = max(cands, key=lambda c: c[2])[0]
+                                prev_cx = cx
+                                lost_count = 0
+                            else:
+                                # Hold previous position; don't whip across the screen for 1 dropped frame
+                                cx = prev_cx
+
+            prev_gray = gray
             raw.append((t - start, cx))
             t += step
             for _ in range(frame_interval - 1):
@@ -371,46 +543,94 @@ def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w
         cap.release()
 
     valid = [(tt, c) for tt, c in raw if c is not None]
-    if len(valid) < max(3, len(raw) * 0.15):
+    if not valid:
         return None
 
-    filled: list[float] = []
-    last = valid[0][1]
-    for _tt, c in raw:
+    # Calculate median detected speaker position as the robust anchor
+    sorted_valid_x = sorted([c for _, c in valid])
+    anchor_cx = sorted_valid_x[len(sorted_valid_x) // 2]
+
+    # Fill missing frames: if speaker is momentarily occluded or looks down,
+    # stay locked on their known position instead of jumping to dead-center empty space!
+    filled: list[tuple[float, float]] = []
+    last = valid[0][1] if valid else anchor_cx
+    for tt, c in raw:
         if c is not None:
             last = c
-        filled.append(last)
+        filled.append((tt, last))
 
-    sm = []
-    for i in range(len(filled)):
-        win = sorted(filled[max(0, i - 2): i + 3])
-        sm.append(win[len(win) // 2])
+    return _build_cinematic_path(filled, crop_w, src_w, end - start)
 
-    dead = crop_w * 0.06
-    max_speed = crop_w * 0.9
-    cam = sm[0]
-    path = []
-    for (tt, _), target in zip(raw, sm):
-        diff = target - cam
-        if abs(diff) > dead:
-            move = abs(diff) - dead
-            move = min(move, max_speed * step)
-            cam += move if diff > 0 else -move
-        path.append((tt, cam))
 
+def _build_cinematic_path(raw_points: list[tuple[float, float]], crop_w: int, src_w: int, duration: float) -> list[tuple[float, float]]:
+    """Convert raw face tracking points into a stabilized cinematic camera track.
+    Locks rock-solid like a tripod on stationary speakers (eliminating micro-jitter on head nods),
+    and executes fluid, eased pans only when a speaker genuinely moves or changes seats.
+    """
+    if not raw_points:
+        return []
     half = crop_w / 2
-    pts = [(tt, min(max(c - half, 0), src_w - crop_w)) for tt, c in path]
-    eps = 4.0
-    simp = _rdp(pts, eps)
-    while len(simp) > 16:
-        eps *= 1.4
-        simp = _rdp(pts, eps)
-    if simp:
-        simp[0] = (0.0, simp[0][1])
-        clip_dur = end - start
-        if simp[-1][0] < clip_dur:
-            simp.append((clip_dur, simp[-1][1]))
-    return simp
+    max_x = max(0, src_w - crop_w)
+
+    # 1. Median filter over ~1.5s window to remove brief detection drops/flickers
+    xs = [p[1] for p in raw_points]
+    n = len(xs)
+    med = []
+    for i in range(n):
+        win = sorted(xs[max(0, i - 3): min(n, i + 4)])
+        med.append(win[len(win) // 2])
+
+    # 2. Exponential Moving Average (alpha=0.18) for gentle baseline smoothing
+    ema = [med[0]]
+    alpha = 0.18
+    for val in med[1:]:
+        ema.append(alpha * val + (1.0 - alpha) * ema[-1])
+
+    # 3. Tripod deadband (22% of crop width)
+    # The camera stays 100% stationary unless the speaker's center drifts past this threshold
+    deadband = crop_w * 0.22
+    cam_center = ema[0]
+    initial_crop_x = min(max(cam_center - half, 0), max_x)
+    anchors = [(0.0, round(initial_crop_x, 1))]
+
+    i = 0
+    while i < n:
+        tt = raw_points[i][0]
+        target = ema[i]
+        diff = target - cam_center
+
+        if abs(diff) > deadband:
+            # The speaker has sustained a new position outside the deadband!
+            # Move camera to new center over a smooth 1.2s fluid pan
+            pan_duration = 1.2
+            pan_start_t = max(0.0, tt)
+            pan_end_t = min(round(duration, 3), round(pan_start_t + pan_duration, 3))
+            if pan_end_t <= pan_start_t:
+                pan_end_t = min(round(duration, 3), round(pan_start_t + 0.5, 3))
+
+            new_target = target
+            new_crop_x = min(max(new_target - half, 0), max_x)
+
+            # Anchor at start of pan (holds previous position until pan starts)
+            prev_crop_x = anchors[-1][1]
+            if pan_start_t > anchors[-1][0] + 0.15:
+                anchors.append((round(pan_start_t, 3), prev_crop_x))
+
+            # Anchor at end of pan (completes fluid move to new target)
+            anchors.append((round(pan_end_t, 3), round(new_crop_x, 1)))
+            cam_center = new_target
+
+            # Fast-forward past the pan duration
+            while i < n and raw_points[i][0] < pan_end_t:
+                i += 1
+            continue
+        i += 1
+
+    # Ensure final anchor reaches the end of the clip
+    if anchors[-1][0] < duration:
+        anchors.append((round(duration, 3), anchors[-1][1]))
+
+    return anchors
 
 
 def face_paths_split(src: str, start: float, end: float, src_w: int, src_h: int, crop_w: int,
@@ -420,13 +640,15 @@ def face_paths_split(src: str, start: float, end: float, src_w: int, src_h: int,
         import cv2
     except ImportError:
         return None, None
-    cascade_path = getattr(getattr(cv2, "data", None), "haarcascades", "") + "haarcascade_frontalface_default.xml"
-    cascade = cv2.CascadeClassifier(cascade_path)
-    if cascade.empty():
+
+    frontal, profile, body = _load_cascades(cv2)
+    if not frontal and not profile and not body:
         return None, None
+
     cap = cv2.VideoCapture(src)
     if not cap.isOpened():
         return None, None
+
     det_w = 640
     scale = det_w / src_w if src_w > det_w else 1.0
     t = start
@@ -446,21 +668,25 @@ def face_paths_split(src: str, start: float, end: float, src_w: int, src_h: int,
                 break
             small = cv2.resize(frame, None, fx=scale, fy=scale) if scale != 1.0 else frame
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
-                                             minSize=(max(28, int(35 * scale)), max(28, int(35 * scale))))
+            cands = _detect_speaker_cands(cv2, gray, scale, frontal, profile, body)
             cx_left, cx_right = None, None
-            if len(faces) >= 2:
-                sorted_faces = sorted(faces, key=lambda f: f[0])  # sort left to right
-                cx_left = (sorted_faces[0][0] + sorted_faces[0][2] / 2) / scale
-                cx_right = (sorted_faces[-1][0] + sorted_faces[-1][2] / 2) / scale
-            elif len(faces) == 1:
-                cx = (faces[0][0] + faces[0][2] / 2) / scale
-                if cx < mid_x:
-                    cx_left = cx
-                    cx_right = min(src_w - crop_w / 2, mid_x + crop_w / 2)
-                else:
-                    cx_right = cx
-                    cx_left = max(crop_w / 2, mid_x - crop_w / 2)
+
+            if cands:
+                left_cands = [c for c in cands if c[0] < mid_x]
+                right_cands = [c for c in cands if c[0] >= mid_x]
+
+                if left_cands and right_cands:
+                    cx_left = max(left_cands, key=lambda c: c[2])[0]
+                    cx_right = max(right_cands, key=lambda c: c[2])[0]
+                elif len(cands) >= 2:
+                    sorted_c = sorted(cands, key=lambda c: c[0])
+                    cx_left = sorted_c[0][0]
+                    cx_right = sorted_c[-1][0]
+                elif left_cands:
+                    cx_left = left_cands[0][0]
+                elif right_cands:
+                    cx_right = right_cands[0][0]
+
             raw_left.append((t - start, cx_left))
             raw_right.append((t - start, cx_right))
             t += step
@@ -470,41 +696,52 @@ def face_paths_split(src: str, start: float, end: float, src_w: int, src_h: int,
     finally:
         cap.release()
 
-    def process_raw(raw):
+    def process_raw(raw, default_anchor):
         valid = [(tt, c) for tt, c in raw if c is not None]
-        if len(valid) < max(2, len(raw) * 0.1):
-            return None
-        last = valid[0][1]
-        filled = []
-        for _tt, c in raw:
+        anchor = sorted([c for _, c in valid])[len(valid) // 2] if valid else default_anchor
+        filled: list[tuple[float, float]] = []
+        last = valid[0][1] if valid else anchor
+        for tt, c in raw:
             if c is not None:
                 last = c
-            filled.append(last)
-        half = crop_w / 2
-        pts = [(tt, min(max(c - half, 0), src_w - crop_w)) for (tt, _), c in zip(raw, filled)]
-        eps = 4.0
-        simp = _rdp(pts, eps)
-        while len(simp) > 16:
-            eps *= 1.4
-            simp = _rdp(pts, eps)
-        if simp:
-            simp[0] = (0.0, simp[0][1])
-            clip_dur = end - start
-            if simp[-1][0] < clip_dur:
-                simp.append((clip_dur, simp[-1][1]))
-        return simp
+            filled.append((tt, last))
+        return _build_cinematic_path(filled, crop_w, src_w, end - start)
 
-    return process_raw(raw_left), process_raw(raw_right)
+    has_left = any(c is not None for _, c in raw_left)
+    has_right = any(c is not None for _, c in raw_right)
+    if not has_left and not has_right:
+        return None, None
+
+    default_left = min(crop_w * 0.5, mid_x * 0.5)
+    default_right = max(src_w - crop_w * 0.5, mid_x + (src_w - mid_x) * 0.5)
+
+    path_left = process_raw(raw_left, default_left)
+    path_right = process_raw(raw_right, default_right)
+    return path_left, path_right
 
 
 def _lerp_expr(points: list[tuple[float, float]]) -> str:
-    if len(points) == 1:
+    """Build a smoothstep S-curve eased FFmpeg expression for fluid camera panning without robotic jerk."""
+    if not points:
+        return "0"
+    if len(points) == 1 or all(abs(p[1] - points[0][1]) < 0.5 for p in points):
         return f"{points[0][1]:.1f}"
+
     expr = f"{points[-1][1]:.1f}"
     for (t0, x0), (t1, x1) in reversed(list(zip(points[:-1], points[1:]))):
-        if t1 - t0 < 1e-3:
+        dt = t1 - t0
+        if dt < 1e-3:
             continue
-        seg = f"{x0:.1f}+({x1 - x0:.1f})*(t-{t0:.3f})/{t1 - t0:.3f}"
+        dx = x1 - x0
+        if abs(dx) < 0.5:
+            if expr == f"{x0:.1f}":
+                continue
+            seg = f"{x0:.1f}"
+        else:
+            # Smoothstep (Hermite interpolation: 3u^2 - 2u^3)
+            # Provides 0 acceleration at start and 0 deceleration at end (fluid cinematic pan)
+            u = f"((t-{t0:.3f})/{dt:.3f})"
+            seg = f"{x0:.1f}+({dx:.1f})*{u}*{u}*(3-2*{u})"
         expr = f"if(lt(t,{t1:.3f}),{seg},{expr})"
     return expr
 
@@ -579,11 +816,12 @@ def build_graph(mode: str, aspect: str, src_w: int, src_h: int, tw: int, th: int
     else:
         trim_filter = ";[v_raw]null[v_trim]"
 
-    # Retention punch-in zoom during first 2.2 seconds
+    # Retention punch-in zoom during first 2.2 seconds + periodic micro-zooms every 7.5s (dopamine pacing)
     if dynamic_zoom and aspect in ("9:16", "4:5", "1:1"):
+        z_expr = "if(lt(t,2.2),1.07*(1-0.03*t/2.2),if(lt(mod(t,7.5),3.2),1.045,1.0))"
         zoom_filter = (
-            f";[v_trim]scale=eval=frame:w='if(lt(t,2.2),{tw}*(1+0.07*(1-t/2.2)),{tw})':"
-            f"h='if(lt(t,2.2),{th}*(1+0.07*(1-t/2.2)),{th})',crop={tw}:{th}[v0]"
+            f";[v_trim]scale=eval=frame:w='{tw}*({z_expr})':"
+            f"h='{th}*({z_expr})',crop={tw}:{th}[v0]"
         )
     else:
         zoom_filter = ";[v_trim]null[v0]"
@@ -628,15 +866,18 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
 
     if aspect != "16:9" and crop_w <= sw:
         if mode == "split" and aspect == "9:16":
+            top_h = th // 2
+            split_crop_w = int(round(sh * tw / top_h))
+            split_crop_w = min(sw, split_crop_w - (split_crop_w % 2))
             progress_cb(0.04, "Detecting speakers for split-screen")
-            split_paths = face_paths_split(src, start, end, sw, sh, crop_w)
-            if not split_paths[0] and not split_paths[1]:
+            split_paths = face_paths_split(src, start, end, sw, sh, split_crop_w)
+            if not split_paths or (not split_paths[0] and not split_paths[1]):
                 mode = "face"  # fallback to single face if no multi-face
         if mode == "face":
             progress_cb(0.04, "Tracking faces")
             path = face_path(src, start, end, sw, sh, crop_w)
             if path is None:
-                mode = "center"  # fallback to center
+                mode = "blur"  # fallback to blur so graphics/slides/speakers are never sliced in half
 
     headline_text = (clip.get("title") or "").strip() if (show_headline and aspect in ("9:16", "4:5")) else None
     has_caption_words = captions and any(w["e"] > start and w["s"] < end for w in words)
@@ -690,6 +931,10 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
                 af_chain.extend(["highpass=f=75", "lowpass=f=12000", "afftdn=nf=-25"])
             if norm_audio:
                 af_chain.append("loudnorm=I=-14:LRA=11:TP=-1.5")
+            # Algorithm Hacking: 80ms loop crossfade at tail so TikTok/Shorts loop is 100% pop-free
+            if effective_dur > 2.0:
+                fade_start = max(0.0, effective_dur - 0.08)
+                af_chain.append(f"afade=t=out:st={fade_start:.3f}:d=0.08")
 
             if af_chain:
                 graph = f"{graph};[0:a:0]{','.join(af_chain)}[aout]"

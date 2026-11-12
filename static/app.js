@@ -337,7 +337,10 @@ function VideoPage(id) {
         h("div", { class: "stack", style: { gap: "8px", minWidth: 0 } },
           title,
           c.hook ? h("div", { class: "hook" }, "“" + c.hook + "”") : null,
-          c.reason ? h("div", { class: "small muted" }, c.reason) : null,
+          c.reason ? h("div", { class: "small muted" },
+            c.reason.includes("Seamless Loop") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🔄 Seamless Loop", "ok")) : null,
+            c.reason.replace(/\[🔄 Seamless Loop:[^\]]+\]\s*/, "")
+          ) : null,
           h("div", { class: "times" }, h("span", { class: "small muted" }, "Start"), sInp, useNow(sInp),
             h("span", { class: "small muted" }, "End"), eInp, useNow(eInp), durEl,
             h("button", { class: "btn sm", onclick: () => preview(c) }, "Preview")),
@@ -570,6 +573,7 @@ function LibraryPage() {
       h("div", { class: "field" }, h("span", { class: "lbl" }, "Select TikTok API Account(s)"), accChecks),
       h("label", { class: "field" }, h("span", { class: "lbl" }, "Video Caption / Title"), title),
       h("label", { class: "field" }, h("span", { class: "lbl" }, "Who can watch this video"), priv),
+      h("p", { class: "hint", style: { margin: "0 0 4px" } }, "💡 Inbox Mode delivers an in-app notification to your TikTok mobile app (Inbox tab > System notifications). Tap it to open the editor and hit Post!"),
       h("div", { class: "row end" }, h("button", { class: "btn", onclick: () => close() }, "Cancel"), go)));
   }
 
@@ -655,12 +659,12 @@ function LibraryPage() {
         for (const u of ttUploads) {
           const nm = u.name || "TikTok";
           if (u.status === "uploading") ttBox.append(h("div", {}, chip(`${nm}: ${Math.round((u.progress || 0) * 100)}%`, "info")));
-          else if (u.status === "done") ttBox.append(h("div", {}, chip(nm, "ok"), " Sent to Inbox / Published"));
+          else if (u.status === "done") ttBox.append(h("div", {}, chip(nm, "ok"), " Sent to Inbox 📱", h("div", { class: "hint", style: { fontSize: "11px", marginTop: "2px" } }, "Open TikTok app > Inbox > System notifications to post.")));
           else if (u.status === "failed") ttBox.append(h("div", {}, chip(`${nm} failed`, "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, u.error || "")));
         }
       } else {
         if (c.tiktok_status === "uploading") ttBox.append(chip("TikTok: " + Math.round(c.tiktok_progress * 100) + "%", "info"));
-        else if (c.tiktok_status === "done") ttBox.append(chip("TikTok", "ok"), " Sent to Inbox / Published");
+        else if (c.tiktok_status === "done") ttBox.append(chip("TikTok", "ok"), " Sent to Inbox 📱", h("div", { class: "hint", style: { fontSize: "11px", marginTop: "2px" } }, "Open TikTok app > Inbox > System notifications to post."));
         else if (c.tiktok_status === "failed") ttBox.append(chip("TikTok failed", "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, c.tiktok_error || ""));
       }
       ttBar.style.display = c.tiktok_status === "uploading" ? "" : "none";
