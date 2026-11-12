@@ -143,9 +143,10 @@ def _run_analyze(vid: int) -> None:
         prog("analyzing", 0.0)
         curve = media.energy_curve(audio)
         cands = analyze.find_clips(cfg, tr["sentences"], info["duration"], curve,
-                                   lambda f, m: prog("analyzing", f, m), cancel_check)
+                                   lambda f, m: prog("analyzing", f, m), cancel_check,
+                                   video_path=str(v["path"]))
         if cfg.get("unload_models"):
-            for m in {cfg.get("filter_model"), cfg.get("ranker_model")} - {""}:
+            for m in {cfg.get("filter_model"), cfg.get("ranker_model"), cfg.get("vision_model")} - {"", None}:
                 if cfg.get("llm_provider") == "ollama":
                     models_mgr.ollama_unload(m)
 
@@ -153,9 +154,10 @@ def _run_analyze(vid: int) -> None:
         db.ex("DELETE FROM clips WHERE video_id=? AND status IN ('candidate','failed','queued')", (vid,))
         title = v.get("title") or f"Video {vid}"
         for rank, c in enumerate(cands, 1):
+            opts_json = json.dumps({"reframe": c.get("reframe", "face"), "visual_reason": c.get("visual_reason", "")})
             db.insert("clips", video_id=vid, video_title=title, rank=rank, score=c["score"], title=c["title"],
                       hook=c["hook"], reason=c["reason"], start=round(c["start"], 2), end=round(c["end"], 2),
-                      status="candidate")
+                      status="candidate", render_opts=opts_json)
         db.update("videos", vid, status="ready", stage_label=f"{len(cands)} clips found", progress=1.0, error=None)
     except Cancelled:
         db.update("videos", vid, status="cancelled", stage_label="Cancelled", error=None)

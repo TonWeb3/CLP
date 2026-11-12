@@ -19,6 +19,7 @@ DEFAULTS: dict = {
     "llm_api_key": "",
     "filter_model": "",  # pass 1: proposes moments in each transcript chunk
     "ranker_model": "",  # pass 2: ranks the shortlist
+    "vision_model": "",  # pass 3: visual director (analyzes keyframes for layout & framing)
     "llm_temperature": 0.2,
     "llm_num_ctx": 16384,
     "llm_disable_thinking": True,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+from pathlib import Path
 
 from . import llm
 
@@ -282,7 +283,7 @@ def _overlap(a, b):
     return inter / min(a["end"] - a["start"], b["end"] - b["start"])
 
 
-def find_clips(cfg: dict, sentences: list[dict], duration: float, curve: list[float], progress_cb, cancel_check) -> list[dict]:
+def find_clips(cfg: dict, sentences: list[dict], duration: float, curve: list[float], progress_cb, cancel_check, video_path: str | None = None) -> list[dict]:
     if not sentences:
         raise RuntimeError("No speech was found in this video.")
     cfg = dict(cfg)
@@ -415,4 +416,56 @@ def find_clips(cfg: dict, sentences: list[dict], duration: float, curve: list[fl
         c["score"] = round((1 - ew) * llm_score + ew * en[k] * 10, 2)
         scored.append(c)
     scored.sort(key=lambda c: c["score"], reverse=True)
-    return scored[:want]
+    top_clips = scored[:want]
+
+    # Pass 3: Visual Director (Vision Model frame inspection & framing recommendation)
+    vision_model = (cfg.get("vision_model") or "").strip()
+    if vision_model and video_path and Path(video_path).exists():
+        progress_cb(0.92, "Visual Director: inspecting frames & layout")
+        cancel_check()
+        try:
+            import base64
+            import tempfile
+            from . import media
+
+            with tempfile.TemporaryDirectory(prefix="clipforge-vis-") as td:
+                for idx, c in enumerate(top_clips):
+                    cancel_check()
+                    # Sample 1 keyframe early in the hook, 1 in the middle
+                    t_hook = max(0.0, float(c["start"]) + 0.8)
+                    t_mid = (float(c["start"]) + float(c["end"])) / 2
+
+                    images_b64: list[str] = []
+                    for t_idx, at_sec in enumerate([t_hook, t_mid]):
+                        thumb_file = Path(td) / f"vis_{idx}_{t_idx}.jpg"
+                        if media.make_thumb(video_path, thumb_file, at=at_sec, width=640):
+                            images_b64.append(base64.b64encode(thumb_file.read_bytes()).decode("utf-8"))
+
+                    if images_b64:
+                        try:
+                            vis = llm.analyze_visual_framing(
+                                cfg, vision_model, images_b64,
+                                c["title"], _clip_text(sentences, c["a"], c["b"], 300)
+                            )
+                            layout = vis.get("layout") or "face"
+                            if vis.get("has_onscreen_graphic"):
+                                layout = "blur"
+                            v_score = float(vis.get("visual_hook_score") or 5.0)
+                            v_reason = (vis.get("visual_reason") or "").strip()
+
+                            c["reframe"] = layout
+                            c["visual_reason"] = v_reason
+                            c["visual_score"] = v_score
+                            if v_reason:
+                                c["reason"] = f"[🎬 Vision: {layout.upper()} - {v_reason}] " + c["reason"]
+                            else:
+                                c["reason"] = f"[🎬 Vision: {layout.upper()}] " + c["reason"]
+
+                            if v_score >= 8.0:
+                                c["score"] = round(c["score"] + min(0.6, (v_score - 7.0) * 0.15), 2)
+                        except Exception as vis_err:
+                            log.warning("Vision analysis failed for clip %s: %s", idx, vis_err)
+        except Exception as e:
+            log.warning("Visual Director stage skipped or failed: %s", e)
+
+    return top_clips

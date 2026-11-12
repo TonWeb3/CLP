@@ -127,6 +127,10 @@ def _clip_row(c: dict) -> dict:
     out["path"] = c.get("path")
     out["social_copy"] = json.loads(c["social_copy"]) if c.get("social_copy") else None
     try:
+        out["render_opts"] = json.loads(c.get("render_opts") or "{}")
+    except Exception:
+        out["render_opts"] = {}
+    try:
         out["uploads"] = json.loads(c.get("uploads_json") or "{}")
     except Exception:
         out["uploads"] = {}
@@ -188,6 +192,7 @@ def health():
         "llm_provider": cfg["llm_provider"],
         "filter_model": cfg["filter_model"],
         "ranker_model": cfg["ranker_model"],
+        "vision_model": cfg.get("vision_model", ""),
         "llm": None,
         "llm_models": [],
         "youtube_connected": youtube.connected(),

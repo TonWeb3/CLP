@@ -48,8 +48,10 @@ def _post(url: str, payload: dict, headers: dict | None = None, timeout: int = 9
     return last
 
 
-def chat_json(cfg: dict, model: str, system: str, user: str, schema: dict):
-    """Ask for a JSON answer. Returns the parsed object."""
+def chat_json(cfg: dict, model: str, system: str, user: str, schema: dict, images: list[str] | None = None):
+    """Ask for a JSON answer. Returns the parsed object.
+    Supports optional base64-encoded images for multimodal Vision models.
+    """
     if not model:
         raise LLMError("No LLM model selected. Open the Models page and choose one.")
     provider = cfg.get("llm_provider", "ollama")
@@ -57,10 +59,13 @@ def chat_json(cfg: dict, model: str, system: str, user: str, schema: dict):
 
     if provider == "ollama":
         host = cfg["ollama_host"]
+        user_msg: dict = {"role": "user", "content": user}
+        if images:
+            user_msg["images"] = images
         payload = {
             "model": model,
             "stream": False,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "messages": [{"role": "system", "content": system}, user_msg],
             "format": schema,
             "options": {"temperature": temperature, "num_ctx": int(cfg.get("llm_num_ctx", 16384))},
             "keep_alive": "10m",
@@ -84,10 +89,19 @@ def chat_json(cfg: dict, model: str, system: str, user: str, schema: dict):
         raise LLMError("Set the API base URL in Settings.")
     headers = {"Authorization": f"Bearer {cfg.get('llm_api_key', '')}"}
     sys_full = system + "\n\nReturn ONLY a JSON object matching this JSON schema:\n" + json.dumps(schema)
+
+    if images:
+        user_parts: list[dict] = [{"type": "text", "text": user}]
+        for img_b64 in images:
+            user_parts.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
+        user_msg = {"role": "user", "content": user_parts}
+    else:
+        user_msg = {"role": "user", "content": user}
+
     payload = {
         "model": model,
         "temperature": temperature,
-        "messages": [{"role": "system", "content": sys_full}, {"role": "user", "content": user}],
+        "messages": [{"role": "system", "content": sys_full}, user_msg],
         "response_format": {"type": "json_object"},
     }
     r = _post(base + "/chat/completions", payload, headers)
@@ -182,3 +196,45 @@ def generate_social_post(cfg: dict, clip_title: str, hook: str, transcript_snipp
         f"Transcript:\n{transcript_snippet}\n"
     )
     return chat_json(cfg, model, system, user, SOCIAL_SCHEMA)
+
+
+VISION_DIRECTOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "layout": {
+            "type": "string",
+            "enum": ["face", "split", "blur", "center"],
+        },
+        "visual_hook_score": {
+            "type": "number",
+        },
+        "visual_reason": {
+            "type": "string",
+        },
+        "has_onscreen_graphic": {
+            "type": "boolean",
+        },
+    },
+    "required": ["layout", "visual_hook_score", "visual_reason", "has_onscreen_graphic"],
+}
+
+
+def analyze_visual_framing(cfg: dict, model: str, images_b64: list[str], title: str, transcript_snippet: str) -> dict:
+    """Pass 3 Visual Director: analyzes video keyframe(s) to recommend optimal framing and score visual energy."""
+    system = (
+        "You are an elite short-form video director and AI cinematographer for TikTok, YouTube Shorts, and Instagram Reels.\n"
+        "Your mission is to look at the video frame(s) and determine the exact camera framing layout so the clip looks professionally edited.\n\n"
+        "Framing modes:\n"
+        "1. 'split': Use when there are TWO distinct people in dialogue (e.g., podcast host and guest seated across each other). This triggers stacked dual-camera view.\n"
+        "2. 'blur': Use when the frame displays an ON-SCREEN GRAPHIC, photo, meme, headline, tweet, or B-roll insert spanning the 16:9 frame. This fits the full graphic with an aesthetic blurred background so it is never sliced in half.\n"
+        "3. 'face': Use when there is a SINGLE primary speaker talking to camera or solo commentary.\n"
+        "4. 'center': Use for general wide shots or gaming.\n\n"
+        "Score visual_hook_score 1.0 to 10.0 based on facial expression intensity, gestures, visual contrast, or meme intrigue.\n"
+        "Return valid JSON matching the schema."
+    )
+    user = (
+        f"Clip Title: {title}\n"
+        f"Spoken Dialogue: {transcript_snippet}\n"
+        "Analyze the provided video frame(s). What is the optimal framing mode?"
+    )
+    return chat_json(cfg, model, system, user, VISION_DIRECTOR_SCHEMA, images=images_b64)

@@ -292,7 +292,11 @@ function VideoPage(id) {
 
     function makeCard(c) {
       const sel = h("input", { type: "checkbox", checked: !!c.selected, "aria-label": "Select clip", onchange: guard(async () => {
-        c.selected = sel.checked; el.classList.toggle("selected", c.selected); drawSeg(c); updateRenderBar();
+        c.selected = sel.checked; el.classList.toggle("selected", c.selected); drawSeg(c);
+        if (c.selected && c.render_opts && c.render_opts.reframe) {
+          reframe.value = c.render_opts.reframe;
+        }
+        updateRenderBar();
         await api(`/clips/${c.id}`, { method: "PATCH", json: { selected: c.selected } });
       }) });
       const title = h("input", { type: "text", class: "title", value: c.title, "aria-label": "Clip title", onchange: guard(async () => {
@@ -339,7 +343,10 @@ function VideoPage(id) {
           c.hook ? h("div", { class: "hook" }, "“" + c.hook + "”") : null,
           c.reason ? h("div", { class: "small muted" },
             c.reason.includes("Seamless Loop") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🔄 Seamless Loop", "ok")) : null,
-            c.reason.replace(/\[🔄 Seamless Loop:[^\]]+\]\s*/, "")
+            (c.render_opts && c.render_opts.reframe === "split") || c.reason.includes("[🎬 Vision: SPLIT") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🎬 Vision: Dual Split", "warn")) : null,
+            (c.render_opts && c.render_opts.reframe === "blur") || c.reason.includes("[🎬 Vision: BLUR") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🎬 Vision: Graphic Blur", "err")) : null,
+            (c.render_opts && c.render_opts.reframe === "face") || c.reason.includes("[🎬 Vision: FACE") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🎬 Vision: Follow Speaker", "ok")) : null,
+            c.reason.replace(/\[🔄 Seamless Loop:[^\]]+\]\s*/, "").replace(/\[🎬 Vision:[^\]]+\]\s*/, "")
           ) : null,
           h("div", { class: "times" }, h("span", { class: "small muted" }, "Start"), sInp, useNow(sInp),
             h("span", { class: "small muted" }, "End"), eInp, useNow(eInp), durEl,
@@ -355,8 +362,10 @@ function VideoPage(id) {
       : h("div", { class: "empty" }, "No suggestions yet. Add a clip at the playhead, or press Find again."));
 
     const sels = () => data.clips.filter((c) => c.selected);
+    const firstVis = data.clips.find((c) => c.render_opts && c.render_opts.reframe);
+    const initialReframe = (firstVis && firstVis.render_opts.reframe) || defaults.reframe || "face";
     const aspect = h("select", { "aria-label": "Shape" }, [["9:16", "Vertical 9:16"], ["1:1", "Square 1:1"], ["4:5", "Portrait 4:5"], ["16:9", "Wide 16:9"]].map(([v2, t]) => h("option", { value: v2, selected: v2 === (defaults.aspect || "9:16") }, t)));
-    const reframe = h("select", { "aria-label": "Framing" }, [["face", "Follow speaker"], ["split", "Split-screen (2 speakers)"], ["center", "Center crop"], ["blur", "Fit with blurred background"]].map(([v2, t]) => h("option", { value: v2, selected: v2 === (defaults.reframe || "face") }, t)));
+    const reframe = h("select", { "aria-label": "Framing" }, [["face", "Follow speaker"], ["split", "Split-screen (2 speakers)"], ["center", "Center crop"], ["blur", "Fit with blurred background"]].map(([v2, t]) => h("option", { value: v2, selected: v2 === initialReframe }, t)));
     const preset = h("select", { "aria-label": "Caption style" }, [["classic", "Classic Subtitles"], ["hormozi", "Hormozi (Bold Neon)"], ["mrbeast", "MrBeast (Punchy)"], ["minimalist", "Minimalist Clean"]].map(([v2, t]) => h("option", { value: v2, selected: v2 === (defaults.caption_preset || "classic") }, t)));
     const caps = h("input", { type: "checkbox", checked: defaults.captions !== false, id: "caps" });
     const headline = h("input", { type: "checkbox", checked: defaults.headline_banner !== false, id: "headline" });
@@ -995,6 +1004,8 @@ const RECOMMENDED = [
   { name: "qwen3:30b", fit: "24 GB GPU", note: "Mixture-of-experts. High quality at good speed." },
   { name: "qwen3:32b", fit: "24 GB GPU", note: "Best quality for a single 24 GB card." },
   { name: "gemma3:27b", fit: "24 GB GPU", note: "Strong at judging tone and humor." },
+  { name: "llama3.2-vision:11b", fit: "12-16 GB GPU", note: "Multimodal Vision model. Inspects video frames and auto-sets camera framing." },
+  { name: "qwen2-vl:7b", fit: "8-12 GB GPU", note: "Fast vision model for layout detection and multi-speaker awareness." },
 ];
 
 function ModelsPage() {
@@ -1005,6 +1016,7 @@ function ModelsPage() {
   const pullInput = h("input", { type: "text", placeholder: "Model name, e.g. qwen3:14b", "aria-label": "Model to download", list: "installed-models" });
   const filterIn = h("input", { type: "text", list: "installed-models", placeholder: "Model name", "aria-label": "First pass model" });
   const rankerIn = h("input", { type: "text", list: "installed-models", placeholder: "Model name", "aria-label": "Ranking model" });
+  const visionIn = h("input", { type: "text", list: "installed-models", placeholder: "Model name, e.g. llama3.2-vision:11b", "aria-label": "Vision Director model" });
   const dl = h("datalist", { id: "installed-models" });
   const listBox = h("div"), pullsBox = h("div"), recBox = h("div");
   let timer, busyPoll = false;
@@ -1027,12 +1039,14 @@ function ModelsPage() {
       h("label", { class: "field" }, h("span", { class: "lbl" }, "First pass (reads the whole transcript)"), filterIn,
         h("span", { class: "hint" }, "A smaller, faster model is fine here.")),
       h("label", { class: "field" }, h("span", { class: "lbl" }, "Ranking (picks the final order)"), rankerIn,
-        h("span", { class: "hint" }, "Use your strongest model. Use the same one for both if you only have one."))),
+        h("span", { class: "hint" }, "Use your strongest model. Use the same one for both if you only have one.")),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Vision Director (inspects frames & auto-sets framing)"), visionIn,
+        h("span", { class: "hint" }, "e.g. llama3.2-vision:11b or qwen2-vl:7b. Optional: leave blank to use default framing."))),
     h("div", { class: "row", style: { marginTop: "12px" } }, h("button", { class: "btn primary", onclick: guard(saveRoles) }, "Save choices")));
 
   async function saveRoles() {
-    await api("/settings", { method: "POST", json: { filter_model: filterIn.value.trim(), ranker_model: rankerIn.value.trim() } });
-    settings.filter_model = filterIn.value.trim(); settings.ranker_model = rankerIn.value.trim();
+    await api("/settings", { method: "POST", json: { filter_model: filterIn.value.trim(), ranker_model: rankerIn.value.trim(), vision_model: visionIn.value.trim() } });
+    settings.filter_model = filterIn.value.trim(); settings.ranker_model = rankerIn.value.trim(); settings.vision_model = visionIn.value.trim();
     toast("Model choices saved."); renderOllama();
   }
   async function pull(name) {
@@ -1073,11 +1087,13 @@ function ModelsPage() {
         const roles = [];
         if (m.name === settings.filter_model) roles.push(chip("First pass", "ok"));
         if (m.name === settings.ranker_model) roles.push(chip("Ranking", "ok"));
+        if (m.name === settings.vision_model) roles.push(chip("Vision Director", "ok"));
         return h("div", { class: "model" },
           h("div", {}, h("strong", {}, m.name), " ", h("span", { class: "small muted" }, [m.params, m.quant, fmtBytes(m.size)].filter(Boolean).join(" · ")), " ", roles),
           h("div", { class: "row" },
             h("button", { class: "btn sm", onclick: guard(() => setRole("filter_model", m.name, filterIn)) }, "Use for first pass"),
             h("button", { class: "btn sm", onclick: guard(() => setRole("ranker_model", m.name, rankerIn)) }, "Use for ranking"),
+            h("button", { class: "btn sm", onclick: guard(() => setRole("vision_model", m.name, visionIn)) }, "Use for vision"),
             h("button", { class: "btn sm danger ghost", onclick: guard(async () => { if (confirm(`Remove ${m.name} from this server?`)) { await api("/models/ollama?name=" + encodeURIComponent(m.name), { method: "DELETE" }); await loadAll(); } }) }, "Remove")));
       })] : (ollama.ok ? [h("p", { class: "muted" }, "No models installed yet. Pick one below.")] : [])));
 
@@ -1092,7 +1108,8 @@ function ModelsPage() {
   async function setRole(key, name, input) {
     await api("/settings", { method: "POST", json: { [key]: name } });
     settings[key] = name; input.value = name; renderOllama();
-    toast(key === "filter_model" ? `${name} will do the first pass.` : `${name} will do the ranking.`);
+    const roleTxt = key === "filter_model" ? "the first pass" : key === "ranker_model" ? "the ranking" : "the vision director";
+    toast(`${name} will do ${roleTxt}.`);
   }
 
   function renderWhisper() {
@@ -1143,8 +1160,9 @@ function ModelsPage() {
   async function loadAll() {
     const [s, o, w, hl] = await Promise.all([api("/settings"), api("/models/ollama"), api("/models/whisper"), api("/health").catch(() => null)]);
     settings = s.settings; ollama = o; whisper = w; health = hl;
-    if (document.activeElement !== filterIn) filterIn.value = settings.filter_model;
-    if (document.activeElement !== rankerIn) rankerIn.value = settings.ranker_model;
+    if (document.activeElement !== filterIn) filterIn.value = settings.filter_model || "";
+    if (document.activeElement !== rankerIn) rankerIn.value = settings.ranker_model || "";
+    if (document.activeElement !== visionIn) visionIn.value = settings.vision_model || "";
     try { status = await api("/models/status"); } catch { /* ignore */ }
     renderSys(); renderOllama(); renderWhisper();
   }
@@ -1171,6 +1189,7 @@ const SCHEMA = [
     { key: "llm_api_key", label: "API key", type: "secret", show: (s) => s.llm_provider === "openai" },
     { key: "filter_model", label: "First-pass model", type: "text", hint: "Reads the whole transcript in sections. Smaller is fine." },
     { key: "ranker_model", label: "Ranking model", type: "text", hint: "Picks the final order. Use your best model." },
+    { key: "vision_model", label: "Vision Director model (optional)", type: "text", hint: "Inspects video frames to recommend framing (e.g. llama3.2-vision:11b, qwen2-vl:7b)." },
     { key: "llm_temperature", label: "Temperature", type: "number", step: 0.05, min: 0, max: 1.5, hint: "Lower is steadier. 0.2 works well." },
     { key: "llm_num_ctx", label: "Context size (tokens)", type: "number", step: 1024, min: 2048, show: (s) => s.llm_provider === "ollama", hint: "Raise this if long sections get cut off. Uses more VRAM." },
     { key: "llm_disable_thinking", label: "Turn off thinking mode", type: "bool", show: (s) => s.llm_provider === "ollama", hint: "Much faster for models that think before answering." },
