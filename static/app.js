@@ -1137,6 +1137,10 @@ function ModelsPage() {
     if (!health) { sysBox.replaceChildren(h("p", { class: "muted" }, "Checking this server...")); return; }
     const gpu = health.gpus.length ? health.gpus.map((g) => `${g.name} (${(g.vram_total_mb / 1024).toFixed(0)} GB)`).join(", ") : "None detected. Speech recognition will run on the CPU, which is slow.";
     const yes = (ok, t) => chip(t, ok ? "ok" : "err");
+    const trackerOk = health.face_tracker && health.face_tracker.active === "yunet";
+    const trackerLabel = (health.face_tracker && health.face_tracker.label) || "Checking...";
+    const trackerKind = trackerOk ? "ok" : (health.face_tracker && health.face_tracker.ready ? "warn" : "err");
+
     sysBox.replaceChildren(h("header", {}, h("h2", {}, "This server")),
       h("dl", { class: "kv" },
         h("dt", {}, "GPU"), h("dd", {}, gpu),
@@ -1144,6 +1148,7 @@ function ModelsPage() {
         h("dt", {}, "Video encoder"), h("dd", {}, health.encoder === "h264_nvenc" ? "GPU (NVENC)" : health.encoder === "libx264" ? "CPU (x264)" : "Unknown"),
         h("dt", {}, "Downloader"), h("dd", {}, yes(!!health.yt_dlp, health.yt_dlp ? "yt-dlp " + health.yt_dlp : "Missing")),
         h("dt", {}, "Speech engine"), h("dd", {}, yes(!!health.faster_whisper, health.faster_whisper ? "faster-whisper " + health.faster_whisper : "Missing")),
+        h("dt", {}, "Face tracker"), h("dd", {}, chip(trackerLabel, trackerKind)),
         h("dt", {}, "Language model"), h("dd", {}, yes(health.llm, health.llm ? "Connected" : "Not connected"), " ", h("span", { class: "small muted" }, health.llm ? "" : health.llm_message))));
   }
 

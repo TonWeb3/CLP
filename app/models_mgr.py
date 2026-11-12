@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import threading
@@ -240,3 +241,17 @@ def faster_whisper_version() -> str | None:
         return faster_whisper.__version__
     except Exception:  # noqa: BLE001
         return None
+
+
+def face_tracker_info() -> dict:
+    try:
+        import cv2
+        has_yunet_class = hasattr(cv2, "FaceDetectorYN")
+        model_path = Path(__file__).parent / "pipeline" / "models" / "face_detection_yunet_2023mar.onnx"
+        has_onnx = model_path.is_file() and model_path.stat().st_size > 100000
+        if has_yunet_class and has_onnx:
+            return {"active": "yunet", "label": "OpenCV YuNet (Neural ONNX)", "ready": True}
+        return {"active": "cascades", "label": "Haar Cascades (CPU Fallback)", "ready": True}
+    except Exception:  # noqa: BLE001
+        return {"active": "none", "label": "Missing OpenCV", "ready": False}
+

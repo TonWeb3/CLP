@@ -193,6 +193,7 @@ def health():
         "filter_model": cfg["filter_model"],
         "ranker_model": cfg["ranker_model"],
         "vision_model": cfg.get("vision_model", ""),
+        "face_tracker": models_mgr.face_tracker_info(),
         "llm": None,
         "llm_models": [],
         "youtube_connected": youtube.connected(),

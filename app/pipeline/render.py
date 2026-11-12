@@ -1033,16 +1033,18 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
     crop_box = None
 
     if aspect != "16:9" and crop_w <= sw:
+        has_yunet = (Path(__file__).parent / "models" / "face_detection_yunet_2023mar.onnx").is_file()
+        engine_label = "YuNet Neural" if has_yunet else "Cascades"
         if mode == "split" and aspect == "9:16":
             top_h = th // 2
             split_crop_w = int(round(sh * tw / top_h))
             split_crop_w = min(sw, split_crop_w - (split_crop_w % 2))
-            progress_cb(0.04, "Detecting speakers for split-screen")
+            progress_cb(0.04, f"Detecting split speakers ({engine_label})")
             split_paths = face_paths_split(src, start, end, sw, sh, split_crop_w)
             if not split_paths or (not split_paths[0] and not split_paths[1]):
                 mode = "face"  # fallback to single face if no multi-face
         if mode == "face":
-            progress_cb(0.04, "Tracking faces")
+            progress_cb(0.04, f"Tracking faces ({engine_label})")
             res = face_path(src, start, end, sw, sh, crop_w)
             if res is None:
                 mode = "blur"  # fallback to blur so graphics/slides/speakers are never sliced in half
