@@ -582,8 +582,11 @@ def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w
 
                     if desired_side != active_side:
                         side_switch_hold += 1
-                        threshold = 2 if is_shot_cut else 5
+                        threshold = 2 if is_shot_cut else 4
                         if side_switch_hold >= threshold or active_side is None:
+                            if active_side is not None and desired_side != active_side:
+                                # Virtual Multi-Camera Hard Cut: instant angle switch between speakers
+                                shot_cuts.append(round(t - start, 3))
                             active_side = desired_side
                             side_switch_hold = 0
                     else:
@@ -720,13 +723,13 @@ def _build_cinematic_path(raw_points: list[tuple[float, float]], crop_w: int, sr
         diff = target - cam_center
 
         if abs(diff) > deadband:
-            # Check if this movement coincides with a broadcast shot cut
-            is_cut = any(abs(tt - tc) <= 0.45 for tc in cuts)
-            pan_duration = 0.04 if is_cut else 1.2
+            # Broadcast Multi-Cam Switcher: Instant cut (0.04s) to the active speaker
+            # Completely eliminates awkward camera sliding/panning across podcast tables
+            pan_duration = 0.04
             pan_start_t = max(0.0, tt)
             pan_end_t = min(round(duration, 3), round(pan_start_t + pan_duration, 3))
             if pan_end_t <= pan_start_t:
-                pan_end_t = min(round(duration, 3), round(pan_start_t + (0.04 if is_cut else 0.5), 3))
+                pan_end_t = min(round(duration, 3), round(pan_start_t + 0.04, 3))
 
             new_target = target
             new_crop_x = float(min(max(new_target - half, 0), max_x))
