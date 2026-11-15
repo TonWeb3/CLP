@@ -1194,7 +1194,7 @@ const SCHEMA = [
     { key: "llm_api_key", label: "API key", type: "secret", show: (s) => s.llm_provider === "openai" },
     { key: "filter_model", label: "First-pass model", type: "text", hint: "Reads the whole transcript in sections. Smaller is fine." },
     { key: "ranker_model", label: "Ranking model", type: "text", hint: "Picks the final order. Use your best model." },
-    { key: "vision_model", label: "Vision Director model (optional)", type: "text", hint: "Inspects video frames to recommend framing (e.g. llama3.2-vision:11b, qwen2-vl:7b)." },
+    { key: "vision_model", label: "Vision Director model (optional)", type: "text", hint: "Assists OpenCV YuNet during rendering to detect slides/graphics, multi-speaker layouts, and camera framing (e.g. llama3.2-vision:11b, qwen2-vl:7b)." },
     { key: "llm_temperature", label: "Temperature", type: "number", step: 0.05, min: 0, max: 1.5, hint: "Lower is steadier. 0.2 works well." },
     { key: "llm_num_ctx", label: "Context size (tokens)", type: "number", step: 1024, min: 2048, show: (s) => s.llm_provider === "ollama", hint: "Raise this if long sections get cut off. Uses more VRAM." },
     { key: "llm_disable_thinking", label: "Turn off thinking mode", type: "bool", show: (s) => s.llm_provider === "ollama", hint: "Much faster for models that think before answering." },

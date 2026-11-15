@@ -196,6 +196,10 @@ def _run_render(clip_id: int) -> None:
     except Exception as e:  # noqa: BLE001
         log.error("render failed for clip %s:\n%s", clip_id, traceback.format_exc())
         db.update("clips", clip_id, status="failed", error=str(e)[:2000])
+    finally:
+        if cfg.get("unload_models") and cfg.get("vision_model"):
+            if cfg.get("llm_provider") == "ollama":
+                models_mgr.ollama_unload(cfg["vision_model"])
 
 
 # --------------------------------------------------------------------------

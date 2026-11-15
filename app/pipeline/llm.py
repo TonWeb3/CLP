@@ -214,27 +214,34 @@ VISION_DIRECTOR_SCHEMA = {
         "has_onscreen_graphic": {
             "type": "boolean",
         },
+        "primary_speaker_side": {
+            "type": "string",
+            "enum": ["left", "right", "center", "both"],
+        },
     },
-    "required": ["layout", "visual_hook_score", "visual_reason", "has_onscreen_graphic"],
+    "required": ["layout", "visual_reason", "has_onscreen_graphic"],
 }
 
 
-def analyze_visual_framing(cfg: dict, model: str, images_b64: list[str], title: str, transcript_snippet: str) -> dict:
-    """Pass 3 Visual Director: analyzes video keyframe(s) to recommend optimal framing and score visual energy."""
+def analyze_visual_framing(cfg: dict, model: str, images_b64: list[str], title: str = "", transcript_snippet: str = "") -> dict:
+    """Vision Director: analyzes video keyframe(s) to assist the OpenCV/YuNet render engine with framing layout and speaker positioning."""
     system = (
-        "You are an elite short-form video director and AI cinematographer for TikTok, YouTube Shorts, and Instagram Reels.\n"
-        "Your mission is to look at the video frame(s) and determine the exact camera framing layout so the clip looks professionally edited.\n\n"
+        "You are an elite AI cinematographer and video director for vertical 9:16 video (TikTok, YouTube Shorts, Reels).\n"
+        "Your mission is to inspect the video frame(s) to assist the computer-vision face tracker (OpenCV YuNet) with camera framing:\n\n"
         "Framing modes:\n"
-        "1. 'split': Use when there are TWO distinct people in dialogue (e.g., podcast host and guest seated across each other). This triggers stacked dual-camera view.\n"
-        "2. 'blur': Use when the frame displays an ON-SCREEN GRAPHIC, photo, meme, headline, tweet, or B-roll insert spanning the 16:9 frame. This fits the full graphic with an aesthetic blurred background so it is never sliced in half.\n"
-        "3. 'face': Use when there is a SINGLE primary speaker talking to camera or solo commentary.\n"
-        "4. 'center': Use for general wide shots or gaming.\n\n"
-        "Score visual_hook_score 1.0 to 10.0 based on facial expression intensity, gestures, visual contrast, or meme intrigue.\n"
+        "1. 'split': Use when there are TWO distinct people in dialogue (e.g. podcast host on left, guest on right). This instructs the renderer to produce a stacked top/bottom split-screen.\n"
+        "2. 'blur': Use when the frame displays an ON-SCREEN GRAPHIC, presentation slide, screen capture, meme, document, or wide b-roll spanning the 16:9 frame. This fits the full frame with a blurred background so text/graphics are never cut off.\n"
+        "3. 'face': Use when there is a SINGLE primary speaker talking to camera or standard multi-camera podcast cutting.\n"
+        "4. 'center': Use for general wide shots or centered content.\n\n"
+        "Identify:\n"
+        "- has_onscreen_graphic: true if there is a graphic/slide/tweet/meme that must be kept visible.\n"
+        "- primary_speaker_side: 'left', 'right', 'center', or 'both'.\n"
+        "- visual_reason: concise reason for the framing decision.\n"
         "Return valid JSON matching the schema."
     )
     user = (
-        f"Clip Title: {title}\n"
-        f"Spoken Dialogue: {transcript_snippet}\n"
-        "Analyze the provided video frame(s). What is the optimal framing mode?"
+        f"Clip: {title}\n"
+        f"Context: {transcript_snippet}\n"
+        "Analyze the visual composition of these frame(s). What is the optimal camera framing directive for the render engine?"
     )
     return chat_json(cfg, model, system, user, VISION_DIRECTOR_SCHEMA, images=images_b64)

@@ -472,16 +472,20 @@ def _detect_speaker_cands(cv2, frame, gray, scale, yunet, frontal, profile, body
 
 
 def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w: int,
-              samples_per_sec: float = 4.0) -> tuple[list[tuple[float, float]], tuple[int, int, int]] | None:
+              samples_per_sec: float = 4.0, vision_hints: dict | None = None) -> tuple[list[tuple[float, float]], tuple[int, int, int]] | None:
     """Return (path, (cw, ch, crop_y)) or None if no speaker was found.
     Features:
-    1. YuNet Neural Face Tracking + Cascades fallback: 99.5% detection across extreme angles and boom mics.
-    2. Broadcast Shot-Cut Detection: Executes instant hard cuts on camera angle switches instead of slow panning.
-    3. Active Speaker Auto-Cameraman: Detects mouth motion energy using exact YuNet landmarks.
-    4. Dynamic Edge-Centering (Digital Boundary Zoom): Centers speakers at X=540 without border wall clamping.
-    5. Occlusion Resilience: Holds speaker anchor across hand-on-chin / microphone drops.
-    6. B-roll / Graphic Protection: Drops to None if face coverage is under 20% to trigger aesthetic blur fit.
+    1. Vision Model Guidance: Receives visual composition directives to assist neural face tracking.
+    2. YuNet Neural Face Tracking + Cascades fallback: 99.5% detection across extreme angles and boom mics.
+    3. Broadcast Multi-Cam Switcher: Executes instant 0.04s broadcast hard cuts between speakers.
+    4. Active Speaker Auto-Cameraman: Detects mouth motion energy using exact YuNet landmarks.
+    5. Dynamic Edge-Centering (Digital Boundary Zoom): Centers speakers at X=540 without border wall clamping.
+    6. Occlusion Resilience: Holds speaker anchor across hand-on-chin / microphone drops.
+    7. B-roll / Graphic Protection: Drops to None if face coverage is under 20% to trigger aesthetic blur fit.
     """
+    if vision_hints and vision_hints.get("has_onscreen_graphic"):
+        return None
+
     try:
         import cv2
     except ImportError:
@@ -516,7 +520,11 @@ def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w
     # Active Speaker Motion state
     ema_l_motion = 0.0
     ema_r_motion = 0.0
-    active_side = None
+    active_side = (
+        vision_hints.get("primary_speaker_side")
+        if (vision_hints and vision_hints.get("primary_speaker_side") in ("left", "right"))
+        else None
+    )
     side_switch_hold = 0
 
     try:
@@ -999,6 +1007,35 @@ def build_graph(mode: str, aspect: str, src_w: int, src_h: int, tw: int, th: int
     return base + trim_filter + zoom_filter + ";" + _subs_filter(has_subs, "v0", "v")
 
 
+def _consult_vision_model(src: str, start: float, end: float, title: str, cfg: dict, model: str) -> dict | None:
+    """Invokes the multimodal vision model on keyframe(s) from this clip to guide camera framing and layout."""
+    try:
+        import base64
+        import tempfile
+        from . import llm
+
+        # Extract 2 keyframes: 1 early in the shot (0.6s after start), 1 at the midpoint
+        t1 = start + 0.6
+        t2 = (start + end) / 2
+        images_b64: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="clipforge-render-vis-") as td:
+            for i, at_sec in enumerate([t1, t2]):
+                f_path = Path(td) / f"vframe_{i}.jpg"
+                if media.make_thumb(src, f_path, at=at_sec, width=640):
+                    images_b64.append(base64.b64encode(f_path.read_bytes()).decode("utf-8"))
+
+        if not images_b64:
+            return None
+
+        vis = llm.analyze_visual_framing(cfg, model, images_b64, title=title)
+        log.info("Vision Director guidance for render: layout=%s, graphic=%s, reason=%s",
+                 vis.get("layout"), vis.get("has_onscreen_graphic"), vis.get("visual_reason"))
+        return vis
+    except Exception as e:
+        log.warning("Vision model consultation failed during render: %s", e)
+        return None
+
+
 def _slug(text: str, n: int = 48) -> str:
     s = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-").lower()
     return (s[:n].strip("-")) or "clip"
@@ -1038,17 +1075,32 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
     if aspect != "16:9" and crop_w <= sw:
         has_yunet = (Path(__file__).parent / "models" / "face_detection_yunet_2023mar.onnx").is_file()
         engine_label = "YuNet Neural" if has_yunet else "Cascades"
+
+        vision_hints = None
+        vision_model = (cfg.get("vision_model") or "").strip()
+        if vision_model:
+            progress_cb(0.03, f"Vision Director inspecting layout ({vision_model})")
+            vision_hints = _consult_vision_model(src, start, end, clip.get("title") or "", cfg, vision_model)
+            if vision_hints:
+                v_layout = vision_hints.get("layout")
+                has_graphic = vision_hints.get("has_onscreen_graphic")
+                if has_graphic or v_layout == "blur":
+                    mode = "blur"
+                elif v_layout == "split" and aspect == "9:16" and mode not in ("blur", "center"):
+                    mode = "split"
+                engine_label += " + Vision"
+
         if mode == "split" and aspect == "9:16":
             top_h = th // 2
             split_crop_w = int(round(sh * tw / top_h))
             split_crop_w = min(sw, split_crop_w - (split_crop_w % 2))
-            progress_cb(0.04, f"Detecting split speakers ({engine_label})")
+            progress_cb(0.05, f"Detecting split speakers ({engine_label})")
             split_paths = face_paths_split(src, start, end, sw, sh, split_crop_w)
             if not split_paths or (not split_paths[0] and not split_paths[1]):
                 mode = "face"  # fallback to single face if no multi-face
         if mode == "face":
-            progress_cb(0.04, f"Tracking faces ({engine_label})")
-            res = face_path(src, start, end, sw, sh, crop_w)
+            progress_cb(0.05, f"Tracking faces ({engine_label})")
+            res = face_path(src, start, end, sw, sh, crop_w, vision_hints=vision_hints)
             if res is None:
                 mode = "blur"  # fallback to blur so graphics/slides/speakers are never sliced in half
             else:
