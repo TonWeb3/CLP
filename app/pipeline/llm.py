@@ -203,7 +203,14 @@ VISION_DIRECTOR_SCHEMA = {
     "properties": {
         "layout": {
             "type": "string",
-            "enum": ["face", "split", "blur", "center"],
+            "enum": ["face", "split", "gaming", "blur", "center"],
+        },
+        "is_gaming": {
+            "type": "boolean",
+        },
+        "webcam_quadrant": {
+            "type": "string",
+            "enum": ["bottom_right", "bottom_left", "top_right", "top_left", "center", "none"],
         },
         "visual_hook_score": {
             "type": "number",
@@ -226,17 +233,21 @@ VISION_DIRECTOR_SCHEMA = {
 def analyze_visual_framing(cfg: dict, model: str, images_b64: list[str], title: str = "", transcript_snippet: str = "") -> dict:
     """Vision Director: analyzes video keyframe(s) to assist the OpenCV/YuNet render engine with framing layout and speaker positioning."""
     system = (
-        "You are an elite AI cinematographer and video director for vertical 9:16 video (TikTok, YouTube Shorts, Reels).\n"
-        "Your mission is to inspect the video frame(s) to assist the computer-vision face tracker (OpenCV YuNet) with camera framing:\n\n"
+        "You are an elite AI cinematographer and universal video director for short-form video (TikTok, YouTube Shorts, Reels).\n"
+        "Your mission is to inspect the video frame(s) to assist the computer-vision face tracker (OpenCV YuNet) with camera framing across ANY genre:\n\n"
         "Framing modes:\n"
-        "1. 'split': Use when there are TWO distinct people in dialogue (e.g. podcast host on left, guest on right). This instructs the renderer to produce a stacked top/bottom split-screen.\n"
-        "2. 'blur': Use when the frame displays an ON-SCREEN GRAPHIC, presentation slide, screen capture, meme, document, or wide b-roll spanning the 16:9 frame. This fits the full frame with a blurred background so text/graphics are never cut off.\n"
-        "3. 'face': Use when there is a SINGLE primary speaker talking to camera or standard multi-camera podcast cutting.\n"
-        "4. 'center': Use for general wide shots or centered content.\n\n"
+        "1. 'gaming': Use when the video is a VIDEO GAME stream or gameplay footage. If a streamer facecam/webcam is in a corner, this directs the renderer to produce the viral Streamer Cam-Stack (streamer reaction box on top + gameplay action on bottom).\n"
+        "2. 'split': Use when there are TWO distinct people in dialogue (e.g. podcast host on left, guest on right). This instructs the renderer to produce a stacked top/bottom dual-camera split-screen.\n"
+        "3. 'blur': Use when the frame displays an ON-SCREEN GRAPHIC, presentation slide, screen capture, code editor, meme, document, or wide b-roll spanning the 16:9 frame. This fits the full frame with a blurred background so text/graphics are never cut off.\n"
+        "4. 'face': Use when there is a SINGLE primary speaker talking to camera or standard multi-camera podcast cutting.\n"
+        "5. 'center': Use for general wide shots or centered content.\n\n"
         "Identify:\n"
-        "- has_onscreen_graphic: true if there is a graphic/slide/tweet/meme that must be kept visible.\n"
-        "- primary_speaker_side: 'left', 'right', 'center', or 'both'.\n"
-        "- visual_reason: concise reason for the framing decision.\n"
+        "- layout: 'gaming', 'split', 'blur', 'face', or 'center'\n"
+        "- is_gaming: true if gameplay HUD / video game is present\n"
+        "- webcam_quadrant: where the streamer webcam is located, if any ('bottom_right', 'bottom_left', 'top_right', 'top_left', 'none')\n"
+        "- has_onscreen_graphic: true if there is a graphic/slide/tweet/code that must be kept visible\n"
+        "- primary_speaker_side: 'left', 'right', 'center', or 'both'\n"
+        "- visual_reason: concise reason for the framing decision\n"
         "Return valid JSON matching the schema."
     )
     user = (

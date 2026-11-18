@@ -344,6 +344,7 @@ function VideoPage(id) {
           c.reason ? h("div", { class: "small muted" },
             c.reason.includes("Seamless Loop") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🔄 Seamless Loop", "ok")) : null,
             (c.render_opts && c.render_opts.reframe === "split") || c.reason.includes("[🎬 Vision: SPLIT") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🎬 Vision: Dual Split", "warn")) : null,
+            (c.render_opts && c.render_opts.reframe === "gaming") || c.reason.includes("[🎬 Vision: GAMING") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🎮 Vision: Gaming Stack", "info")) : null,
             (c.render_opts && c.render_opts.reframe === "blur") || c.reason.includes("[🎬 Vision: BLUR") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🎬 Vision: Graphic Blur", "err")) : null,
             (c.render_opts && c.render_opts.reframe === "face") || c.reason.includes("[🎬 Vision: FACE") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🎬 Vision: Follow Speaker", "ok")) : null,
             c.reason.replace(/\[🔄 Seamless Loop:[^\]]+\]\s*/, "").replace(/\[🎬 Vision:[^\]]+\]\s*/, "")
@@ -365,7 +366,7 @@ function VideoPage(id) {
     const firstVis = data.clips.find((c) => c.render_opts && c.render_opts.reframe);
     const initialReframe = (firstVis && firstVis.render_opts.reframe) || defaults.reframe || "face";
     const aspect = h("select", { "aria-label": "Shape" }, [["9:16", "Vertical 9:16"], ["1:1", "Square 1:1"], ["4:5", "Portrait 4:5"], ["16:9", "Wide 16:9"]].map(([v2, t]) => h("option", { value: v2, selected: v2 === (defaults.aspect || "9:16") }, t)));
-    const reframe = h("select", { "aria-label": "Framing" }, [["face", "Follow speaker"], ["split", "Split-screen (2 speakers)"], ["center", "Center crop"], ["blur", "Fit with blurred background"]].map(([v2, t]) => h("option", { value: v2, selected: v2 === initialReframe }, t)));
+    const reframe = h("select", { "aria-label": "Framing" }, [["face", "Follow speaker"], ["split", "Split-screen (2 speakers)"], ["gaming", "Gaming Cam-Stack (Streamer top + Game bottom)"], ["center", "Center crop"], ["blur", "Fit with blurred background"]].map(([v2, t]) => h("option", { value: v2, selected: v2 === initialReframe }, t)));
     const preset = h("select", { "aria-label": "Caption style" }, [["classic", "Classic Subtitles"], ["hormozi", "Hormozi (Bold Neon)"], ["mrbeast", "MrBeast (Punchy)"], ["minimalist", "Minimalist Clean"]].map(([v2, t]) => h("option", { value: v2, selected: v2 === (defaults.caption_preset || "classic") }, t)));
     const caps = h("input", { type: "checkbox", checked: defaults.captions !== false, id: "caps" });
     const headline = h("input", { type: "checkbox", checked: defaults.headline_banner !== false, id: "headline" });
@@ -1215,7 +1216,7 @@ const SCHEMA = [
   ] },
   { title: "Rendering", desc: "", fields: [
     { key: "aspect", label: "Default shape", type: "select", options: [["9:16", "Vertical 9:16"], ["1:1", "Square 1:1"], ["4:5", "Portrait 4:5"], ["16:9", "Wide 16:9"]] },
-    { key: "reframe", label: "Default framing", type: "select", options: [["face", "Follow the speaker"], ["split", "Stacked split-screen (2 speakers)"], ["center", "Center crop"], ["blur", "Fit with blurred background"]] },
+    { key: "reframe", label: "Default framing", type: "select", options: [["face", "Follow the speaker"], ["split", "Stacked split-screen (2 speakers)"], ["gaming", "Gaming Cam-Stack (Streamer top + Game bottom)"], ["center", "Center crop"], ["blur", "Fit with blurred background"]] },
     { key: "captions", label: "Burn in captions by default", type: "bool" },
     { key: "caption_preset", label: "Subtitle style preset", type: "select", options: [["classic", "Classic Clean"], ["hormozi", "Hormozi (Bold & Green)"], ["mrbeast", "MrBeast (High Contrast Punchy)"], ["minimalist", "Minimalist (Sleek Understated)"]] },
     { key: "caption_emojis", label: "Auto keyword emojis", type: "bool", hint: "Automatically detects viral/emotional keywords and places animated-style emojis." },

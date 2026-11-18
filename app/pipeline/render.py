@@ -883,6 +883,98 @@ def face_paths_split(src: str, start: float, end: float, src_w: int, src_h: int,
     return path_left, path_right, box_left, box_right
 
 
+def detect_gaming_layout(src: str, start: float, end: float, src_w: int, src_h: int,
+                         tw: int = 1080, th: int = 1920,
+                         webcam_hint: str | None = None) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]] | None:
+    """Detects streamer facecam corner box and center gameplay box for 9:16 Gaming Cam-Stack layout.
+    Returns ((cam_cw, cam_ch, cam_x, cam_y), (game_cw, game_ch, game_x, game_y)) or None.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return None
+
+    frontal, profile, body = _load_cascades(cv2)
+    det_w = 640
+    det_h = max(240, int(det_w * src_h / src_w))
+    yunet = _load_yunet(cv2, (det_w, det_h))
+    if not yunet and not frontal and not profile and not body:
+        return None
+
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        return None
+
+    scale = det_w / src_w if src_w > det_w else 1.0
+    dur = max(1.0, end - start)
+    sample_times = [start + dur * 0.15, start + dur * 0.40, start + dur * 0.65, start + dur * 0.85]
+    all_face_cands: list[dict] = []
+
+    try:
+        for st in sample_times:
+            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, st * 1000))
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            small = cv2.resize(frame, None, fx=scale, fy=scale) if scale != 1.0 else frame
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            cands = _detect_speaker_cands(cv2, small, gray, scale, yunet, frontal, profile, body)
+            for c in cands:
+                all_face_cands.append(c)
+    finally:
+        cap.release()
+
+    if not all_face_cands:
+        return None
+
+    # Filter by webcam quadrant hint if provided by vision model
+    filtered = all_face_cands
+    mid_x = src_w / 2
+    mid_y = src_h / 2
+    if webcam_hint == "bottom_right":
+        filtered = [c for c in all_face_cands if c["cx"] >= mid_x and c["cy"] >= mid_y] or all_face_cands
+    elif webcam_hint == "bottom_left":
+        filtered = [c for c in all_face_cands if c["cx"] < mid_x and c["cy"] >= mid_y] or all_face_cands
+    elif webcam_hint == "top_right":
+        filtered = [c for c in all_face_cands if c["cx"] >= mid_x and c["cy"] < mid_y] or all_face_cands
+    elif webcam_hint == "top_left":
+        filtered = [c for c in all_face_cands if c["cx"] < mid_x and c["cy"] < mid_y] or all_face_cands
+
+    best_face = max(filtered, key=lambda c: c["area"])
+    fc_x, fc_y = best_face["cx"], best_face["cy"]
+
+    cam_h = int(round(th * 0.36))
+    cam_h -= cam_h % 2
+    game_h = th - cam_h
+
+    cam_ar = tw / cam_h
+    face_dim = (best_face["area"] ** 0.5) if best_face.get("area") else (src_h * 0.15)
+    cam_cw = int(round(max(face_dim * 2.8, src_w * 0.22)))
+    cam_cw -= cam_cw % 2
+    cam_ch = int(round(cam_cw / cam_ar))
+    cam_ch -= cam_ch % 2
+
+    if cam_ch > src_h:
+        cam_ch = src_h - (src_h % 2)
+        cam_cw = int(round(cam_ch * cam_ar))
+        cam_cw -= cam_cw % 2
+
+    cam_desired_x = int(fc_x - cam_cw / 2)
+    cam_desired_y = int(fc_y - cam_ch * 0.40)
+    cam_x = max(0, min(src_w - cam_cw, cam_desired_x))
+    cam_y = max(0, min(src_h - cam_ch, cam_desired_y))
+
+    game_ar = tw / game_h
+    game_ch = src_h - (src_h % 2)
+    game_cw = int(round(game_ch * game_ar))
+    game_cw = min(src_w - (src_w % 2), game_cw - (game_cw % 2))
+
+    game_x = (src_w - game_cw) // 2
+    game_y = 0
+
+    return (cam_cw, cam_ch, cam_x, cam_y), (game_cw, game_ch, game_x, game_y)
+
+
 def _lerp_expr(points: list[tuple[float, float]]) -> str:
     """Build a smoothstep S-curve eased FFmpeg expression for fluid camera panning without robotic jerk."""
     if not points:
@@ -930,13 +1022,33 @@ def _subs_filter(has_subs: bool, in_label: str, out_label: str) -> str:
 
 def build_graph(mode: str, aspect: str, src_w: int, src_h: int, tw: int, th: int,
                 path: list[tuple[float, float]] | None, crop_w: int, has_subs: bool,
-                split_paths: tuple | None = None, dynamic_zoom: bool = True,
+                split_paths: tuple | None = None, gaming_boxes: tuple | None = None,
+                dynamic_zoom: bool = True,
                 keep_segs: list[tuple[float, float]] | None = None,
                 crop_box: tuple[int, int, int] | None = None) -> str:
     """Return a -filter_complex graph taking [0:v] and producing [v]."""
     if aspect == "16:9":
         base = (f"[0:v]scale={tw}:{th}:force_original_aspect_ratio=decrease,"
                 f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,setsar=1[v_raw]")
+    elif mode == "gaming" and aspect == "9:16":
+        # Viral Gaming Cam-Stack: Streamer facecam on top (36%) + Center gameplay action on bottom (64%)
+        cam_h = int(round(th * 0.36))
+        cam_h -= cam_h % 2
+        game_h = th - cam_h
+
+        if gaming_boxes:
+            (cam_cw, cam_ch, cam_x, cam_y), (game_cw, game_ch, game_x, game_y) = gaming_boxes
+        else:
+            cam_cw, cam_ch, cam_x, cam_y = (src_w // 2, src_h // 2, src_w // 4, src_h // 4)
+            game_cw, game_ch, game_x, game_y = (src_w, src_h, 0, 0)
+
+        base = (
+            f"[0:v]split=2[raw_cam][raw_game];"
+            f"[raw_cam]crop={cam_cw}:{cam_ch}:{cam_x}:{cam_y},scale={tw}:{cam_h}:flags=lanczos,setsar=1[cam];"
+            f"[raw_game]crop={game_cw}:{game_ch}:{game_x}:{game_y},scale={tw}:{game_h}:flags=lanczos,setsar=1[game];"
+            f"[cam][game]vstack=inputs=2[stacked];"
+            f"[stacked]drawbox=y={cam_h - 2}:color=black@0.85:width=iw:height=4:t=fill[v_raw]"
+        )
     elif mode == "split" and aspect == "9:16":
         # Two stacked frames: Top speaker + Bottom speaker
         top_h = th // 2
@@ -1070,6 +1182,7 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
     progress_cb(0.02, "Preparing")
     path = None
     split_paths = None
+    gaming_boxes = None
     crop_box = None
 
     if aspect != "16:9" and crop_w <= sw:
@@ -1083,12 +1196,23 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
             vision_hints = _consult_vision_model(src, start, end, clip.get("title") or "", cfg, vision_model)
             if vision_hints:
                 v_layout = vision_hints.get("layout")
+                is_gaming = vision_hints.get("is_gaming")
                 has_graphic = vision_hints.get("has_onscreen_graphic")
-                if has_graphic or v_layout == "blur":
+                if is_gaming or v_layout == "gaming":
+                    mode = "gaming"
+                elif has_graphic or v_layout == "blur":
                     mode = "blur"
                 elif v_layout == "split" and aspect == "9:16" and mode not in ("blur", "center"):
                     mode = "split"
                 engine_label += " + Vision"
+
+        if mode == "gaming" and aspect == "9:16":
+            webcam_hint = vision_hints.get("webcam_quadrant") if vision_hints else None
+            progress_cb(0.05, f"Detecting Gaming Cam-Stack ({engine_label})")
+            gaming_boxes = detect_gaming_layout(src, start, end, sw, sh, tw, th, webcam_hint=webcam_hint)
+            if not gaming_boxes:
+                # If no facecam is detected in gameplay, fit full game with blurred background
+                mode = "blur"
 
         if mode == "split" and aspect == "9:16":
             top_h = th // 2
@@ -1145,7 +1269,8 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
                 "utf-8",
             )
         graph = build_graph(mode, aspect, sw, sh, tw, th, path, crop_w, has_subs,
-                            split_paths=split_paths, dynamic_zoom=dynamic_zoom, keep_segs=keep_segs,
+                            split_paths=split_paths, gaming_boxes=gaming_boxes,
+                            dynamic_zoom=dynamic_zoom, keep_segs=keep_segs,
                             crop_box=crop_box)
 
         # Audio handling: synchronized silence trim + denoising + broadcast standard loudnorm
