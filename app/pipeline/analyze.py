@@ -365,20 +365,32 @@ def find_clips(cfg: dict, sentences: list[dict], duration: float, curve: list[fl
     for c in cands:
         if all(_overlap(c, k) < 0.2 for k in kept):
             kept.append(c)
-    shortlist = kept[: min(40, max(want * 2, 12))]
+    shortlist = kept[: min(300, max(int(want * 1.5), 12))]
 
-    # pass 2: rank
+    # pass 2: rank (batches large shortlists so 10-hour videos with up to 200 clips never exceed LLM token limits)
     progress_cb(len(chunks) / (len(chunks) + 1), "Ranking the best moments")
     cancel_check()
     p2: dict[int, dict] = {}
     if len(shortlist) > 1:
-        try:
-            for r in rank(cfg, sentences, shortlist, want):
-                k = int(r["id"]) - 1
-                if 0 <= k < len(shortlist) and k not in p2:
-                    p2[k] = r
-        except (llm.LLMError, KeyError, TypeError, ValueError) as e:
-            log.warning("ranking failed, using pass-1 scores: %s", e)
+        batch_size = 35
+        total_batches = math.ceil(len(shortlist) / batch_size)
+        for b_idx, b_start in enumerate(range(0, len(shortlist), batch_size)):
+            cancel_check()
+            if total_batches > 1:
+                progress_cb(
+                    (len(chunks) + b_idx / total_batches) / (len(chunks) + 1),
+                    f"Ranking the best moments (batch {b_idx + 1} of {total_batches})",
+                )
+            batch_cands = shortlist[b_start:b_start + batch_size]
+            batch_want = min(len(batch_cands), max(1, math.ceil(want * len(batch_cands) / len(shortlist)) + 2))
+            try:
+                for r in rank(cfg, sentences, batch_cands, batch_want):
+                    local_k = int(r["id"]) - 1
+                    global_k = b_start + local_k
+                    if 0 <= local_k < len(batch_cands) and global_k not in p2:
+                        p2[global_k] = r
+            except (llm.LLMError, KeyError, TypeError, ValueError) as e:
+                log.warning("ranking batch %s failed, using pass-1 scores: %s", b_idx, e)
 
     ew = float(cfg.get("energy_weight", 0.15))
     en = energy_scores(curve, shortlist) if curve else [0.5] * len(shortlist)

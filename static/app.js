@@ -1255,7 +1255,7 @@ const SCHEMA = [
   { title: "Choosing clips", desc: "", fields: [
     { key: "min_clip_sec", label: "Shortest clip (seconds)", type: "number", min: 5 },
     { key: "max_clip_sec", label: "Longest clip (seconds)", type: "number", min: 10 },
-    { key: "num_candidates", label: "Suggestions per video", type: "number", min: 1, max: 40 },
+    { key: "num_candidates", label: "Suggestions per video", type: "number", min: 1, max: 200 },
     { key: "chunk_minutes", label: "Section length for the first pass (minutes)", type: "number", min: 2, max: 30, hint: "Longer sections give the model more context but need more memory." },
     { key: "energy_weight", label: "Loudness influence (0 to 0.5)", type: "number", step: 0.05, min: 0, max: 0.5, hint: "Gives a small boost to loud, energetic moments." },
   ] },

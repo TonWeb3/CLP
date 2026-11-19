@@ -135,7 +135,7 @@ def update(patch: dict) -> dict:
         data["min_clip_sec"] = max(5, data["min_clip_sec"])
         if data["max_clip_sec"] < data["min_clip_sec"] + 5:
             data["max_clip_sec"] = data["min_clip_sec"] + 5
-        data["num_candidates"] = min(40, max(1, data["num_candidates"]))
+        data["num_candidates"] = min(200, max(1, data["num_candidates"]))
         data["chunk_minutes"] = min(30, max(2, data["chunk_minutes"]))
         data["caption_words"] = min(8, max(1, data["caption_words"]))
         data["energy_weight"] = min(0.5, max(0.0, data["energy_weight"]))
