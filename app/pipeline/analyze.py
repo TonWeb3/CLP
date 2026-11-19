@@ -283,7 +283,7 @@ def _overlap(a, b):
     return inter / min(a["end"] - a["start"], b["end"] - b["start"])
 
 
-def find_clips(cfg: dict, sentences: list[dict], duration: float, curve: list[float], progress_cb, cancel_check, video_path: str | None = None) -> list[dict]:
+def find_clips(cfg: dict, sentences: list[dict], duration: float, curve: list[float], progress_cb, cancel_check) -> list[dict]:
     if not sentences:
         raise RuntimeError("No speech was found in this video.")
     cfg = dict(cfg)
@@ -294,6 +294,9 @@ def find_clips(cfg: dict, sentences: list[dict], duration: float, curve: list[fl
     cfg["_filter_model"], cfg["_ranker_model"] = f_model, r_model
 
     min_s, max_s = float(cfg["min_clip_sec"]), float(cfg["max_clip_sec"])
+    if duration and duration > 6.0 and duration < min_s * 1.35:
+        min_s = max(5.0, round(duration * 0.45, 1))
+        max_s = max(min_s + 5.0, round(duration, 1))
     want = int(cfg["num_candidates"])
     chunks = make_chunks(sentences, float(cfg["chunk_minutes"]) * 60)
     per_chunk = max(2, math.ceil(want * 2 / len(chunks)))
@@ -368,7 +371,7 @@ def find_clips(cfg: dict, sentences: list[dict], duration: float, curve: list[fl
     progress_cb(len(chunks) / (len(chunks) + 1), "Ranking the best moments")
     cancel_check()
     p2: dict[int, dict] = {}
-    if len(shortlist) > 1 or True:
+    if len(shortlist) > 1:
         try:
             for r in rank(cfg, sentences, shortlist, want):
                 k = int(r["id"]) - 1

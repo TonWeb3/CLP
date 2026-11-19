@@ -41,7 +41,7 @@ def token_path(account_id: int | None = None) -> Path:
     return TOKEN_FILE
 
 
-def _resolve_account(cfg_or_acc: dict | int | None = None) -> dict:
+def _resolve_account(cfg_or_acc: dict | int | None = None, *, for_new_auth: bool = False) -> dict:
     cfg = config.get()
     if isinstance(cfg_or_acc, int):
         acc = db.one("SELECT * FROM social_accounts WHERE id=? AND platform='tiktok'", (cfg_or_acc,))
@@ -65,6 +65,26 @@ def _resolve_account(cfg_or_acc: dict | int | None = None) -> dict:
             acc["privacy"] = cfg.get("tiktok_privacy", "INBOX")
         return acc
     rows = db.q("SELECT * FROM social_accounts WHERE platform='tiktok' ORDER BY id ASC")
+    if for_new_auth:
+        for r in rows:
+            if not token_path(r["id"]).exists():
+                acc = dict(r)
+                if not acc.get("client_id"):
+                    acc["client_id"] = cfg.get("tiktok_client_key", "")
+                if not acc.get("client_secret"):
+                    acc["client_secret"] = cfg.get("tiktok_client_secret", "")
+                if not acc.get("privacy"):
+                    acc["privacy"] = cfg.get("tiktok_privacy", "INBOX")
+                return acc
+        return {
+            "id": None,
+            "name": "TikTok",
+            "username": "",
+            "scope": "",
+            "client_id": cfg.get("tiktok_client_key", ""),
+            "client_secret": cfg.get("tiktok_client_secret", ""),
+            "privacy": cfg.get("tiktok_privacy", "INBOX"),
+        }
     for r in rows:
         if token_path(r["id"]).exists():
             acc = dict(r)
@@ -95,8 +115,9 @@ def redirect_uri_for(base_url: str) -> str:
     return base_url.rstrip("/") + "/api/tiktok/callback"
 
 
-def auth_url(cfg_or_acc: dict | int, redirect_uri: str, scope: str | None = None) -> str:
-    acc = _resolve_account(cfg_or_acc)
+def auth_url(cfg_or_acc: dict | int | None, redirect_uri: str, scope: str | None = None) -> str:
+    is_new = cfg_or_acc is None or (isinstance(cfg_or_acc, dict) and "id" not in cfg_or_acc and "client_id" not in cfg_or_acc)
+    acc = _resolve_account(cfg_or_acc, for_new_auth=is_new)
     key = (acc.get("client_id") or acc.get("tiktok_client_key") or "").strip()
     secret = (acc.get("client_secret") or acc.get("tiktok_client_secret") or "").strip()
     if not key or not secret:
@@ -183,7 +204,10 @@ def finish(state: str, code: str, redirect_uri: str) -> int | None:
         },
         timeout=30,
     )
-    data = resp.json()
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise TikTokError(f"TikTok authentication returned non-JSON (HTTP {resp.status_code}): {resp.text[:200]}") from e
     token_data = data.get("data") if (isinstance(data.get("data"), dict) and data["data"].get("access_token")) else data
     access_token = token_data.get("access_token") if isinstance(token_data, dict) else None
 
@@ -200,10 +224,11 @@ def finish(state: str, code: str, redirect_uri: str) -> int | None:
     if account_id is None:
         cfg = config.get()
         now = time.time()
+        count = len(db.q("SELECT id FROM social_accounts WHERE platform='tiktok'")) + 1
         account_id = db.insert(
             "social_accounts",
             platform="tiktok",
-            name="TikTok Account",
+            name=f"TikTok #{count}",
             client_id="",
             client_secret="",
             privacy=cfg.get("tiktok_privacy", "INBOX"),
@@ -285,7 +310,10 @@ def _get_access_token(acc: dict) -> str:
                 },
                 timeout=30,
             )
-            refresh_data = resp.json()
+            try:
+                refresh_data = resp.json()
+            except Exception:
+                refresh_data = {}
             refreshed = refresh_data.get("data") if (isinstance(refresh_data.get("data"), dict) and refresh_data["data"].get("access_token")) else refresh_data
             if resp.status_code == 200 and isinstance(refreshed, dict) and refreshed.get("access_token"):
                 data.update(refreshed)
@@ -332,14 +360,17 @@ def upload(cfg_or_acc: dict | int, video_path: str | Path, title: str, privacy: 
     is_inbox = (priv == "INBOX")
 
     # Step 1: Chunk Calculation
-    # TikTok requires chunks between 5MB and 64MB. The last chunk may be smaller.
+    # TikTok Content Posting API v2 rules:
+    # - Single chunk: up to 64 MB
+    # - Multi-chunk: each chunk 5 MB..64 MB, total_chunk_count = floor(video_size / chunk_size),
+    #   and the final chunk absorbs the trailing remainder (up to 128 MB) so no chunk is ever < 5 MB.
     MAX_SINGLE_CHUNK = 64 * 1024 * 1024
     if file_size <= MAX_SINGLE_CHUNK:
         chunk_size = file_size
         total_chunks = 1
     else:
         chunk_size = 10 * 1024 * 1024  # 10 MB chunks
-        total_chunks = math.ceil(file_size / chunk_size)
+        total_chunks = max(1, file_size // chunk_size)
 
     # Step 2: Initialize Direct Post or Inbox Draft
     if is_inbox:
@@ -373,8 +404,11 @@ def upload(cfg_or_acc: dict | int, video_path: str | Path, title: str, privacy: 
         }
 
     r = requests.post(init_url, headers=headers, json=init_payload, timeout=30)
-    res = r.json()
-    if r.status_code != 200 or res.get("error", {}).get("code") != "ok":
+    try:
+        res = r.json()
+    except Exception as e:
+        raise TikTokError(f"TikTok upload init returned non-JSON (HTTP {r.status_code}): {r.text[:200]}") from e
+    if r.status_code != 200 or (res.get("error") or {}).get("code") != "ok":
         err_code = (res.get("error") or {}).get("code", "")
         err_msg = (res.get("error") or {}).get("message") or r.text[:300]
         if "unaudited_client" in err_msg.lower() or "unaudited" in err_code.lower():
@@ -394,7 +428,8 @@ def upload(cfg_or_acc: dict | int, video_path: str | Path, title: str, privacy: 
     progress_cb(0.15)
     with open(p, "rb") as vf:
         for chunk_idx in range(total_chunks):
-            chunk_data = vf.read(chunk_size)
+            is_last = (chunk_idx == total_chunks - 1)
+            chunk_data = vf.read() if is_last else vf.read(chunk_size)
             if not chunk_data:
                 break
             start_byte = chunk_idx * chunk_size

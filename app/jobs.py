@@ -17,6 +17,8 @@ log = logging.getLogger("clipforge.jobs")
 
 Q: "queue.Queue[tuple[str, int]]" = queue.Queue()
 CANCELLED: set[int] = set()
+_PENDING: set[tuple[str, int]] = set()
+_q_lock = threading.Lock()
 _started = False
 
 # stage -> (low, high) share of the overall progress bar
@@ -36,7 +38,12 @@ def video_dir(video_id: int) -> Path:
 
 
 def enqueue(kind: str, row_id: int) -> None:
-    Q.put((kind, row_id))
+    item = (kind, row_id)
+    with _q_lock:
+        if item in _PENDING:
+            return
+        _PENDING.add(item)
+        Q.put(item)
 
 
 def start() -> None:
@@ -67,6 +74,8 @@ def _recover() -> None:
 def _loop() -> None:
     while True:
         kind, row_id = Q.get()
+        with _q_lock:
+            _PENDING.discard((kind, row_id))
         try:
             if kind == "analyze":
                 _run_analyze(row_id)
@@ -143,10 +152,9 @@ def _run_analyze(vid: int) -> None:
         prog("analyzing", 0.0)
         curve = media.energy_curve(audio)
         cands = analyze.find_clips(cfg, tr["sentences"], info["duration"], curve,
-                                   lambda f, m: prog("analyzing", f, m), cancel_check,
-                                   video_path=str(v["path"]))
+                                   lambda f, m: prog("analyzing", f, m), cancel_check)
         if cfg.get("unload_models"):
-            for m in {cfg.get("filter_model"), cfg.get("ranker_model"), cfg.get("vision_model")} - {"", None}:
+            for m in {cfg.get("filter_model"), cfg.get("ranker_model")} - {"", None}:
                 if cfg.get("llm_provider") == "ollama":
                     models_mgr.ollama_unload(m)
 
@@ -154,10 +162,9 @@ def _run_analyze(vid: int) -> None:
         db.ex("DELETE FROM clips WHERE video_id=? AND status IN ('candidate','failed','queued')", (vid,))
         title = v.get("title") or f"Video {vid}"
         for rank, c in enumerate(cands, 1):
-            opts_json = json.dumps({"reframe": c.get("reframe", "face"), "visual_reason": c.get("visual_reason", "")})
             db.insert("clips", video_id=vid, video_title=title, rank=rank, score=c["score"], title=c["title"],
                       hook=c["hook"], reason=c["reason"], start=round(c["start"], 2), end=round(c["end"], 2),
-                      status="candidate", render_opts=opts_json)
+                      status="candidate", render_opts="{}")
         db.update("videos", vid, status="ready", stage_label=f"{len(cands)} clips found", progress=1.0, error=None)
     except Cancelled:
         db.update("videos", vid, status="cancelled", stage_label="Cancelled", error=None)
@@ -176,10 +183,10 @@ def _run_render(clip_id: int) -> None:
     if not c:
         return
     v = db.one("SELECT * FROM videos WHERE id=?", (c["video_id"],))
+    cfg = config.get()
     try:
         if not v or not v["path"] or not Path(v["path"]).exists():
             raise RuntimeError("The source video is no longer on disk.")
-        cfg = config.get()
         opts = json.loads(c["render_opts"] or "{}")
         words = json.loads(Path(v["transcript_path"]).read_text("utf-8"))["words"] if v["transcript_path"] else []
         db.update("clips", clip_id, status="rendering", progress=0.0, error=None)
@@ -191,8 +198,11 @@ def _run_render(clip_id: int) -> None:
         old = c.get("path")
         if old and old != res["path"]:
             Path(old).unlink(missing_ok=True)
+        opts["applied_reframe"] = res.get("mode", opts.get("reframe") or cfg["reframe"])
+        if res.get("visual_reason"):
+            opts["visual_reason"] = res["visual_reason"]
         db.update("clips", clip_id, status="ready", progress=1.0, path=res["path"], thumb_path=res["thumb"],
-                  width=res["width"], height=res["height"], size=res["size"], error=None)
+                  width=res["width"], height=res["height"], size=res["size"], render_opts=json.dumps(opts), error=None)
     except Exception as e:  # noqa: BLE001
         log.error("render failed for clip %s:\n%s", clip_id, traceback.format_exc())
         db.update("clips", clip_id, status="failed", error=str(e)[:2000])
@@ -220,7 +230,31 @@ def _update_clip_account_upload(clip_id: int, key: str, info: dict) -> None:
         cur = uploads.get(key) or {}
         cur.update(info)
         uploads[key] = cur
-        db.update("clips", clip_id, uploads_json=json.dumps(uploads))
+
+        fields: dict = {"uploads_json": json.dumps(uploads)}
+        for plat, prefix in (("youtube", "yt"), ("tiktok", "tiktok")):
+            p_entries = [u for u in uploads.values() if isinstance(u, dict) and u.get("platform") == plat]
+            if not p_entries:
+                continue
+            uploading = [u for u in p_entries if u.get("status") == "uploading"]
+            done = [u for u in p_entries if u.get("status") == "done"]
+            failed = [u for u in p_entries if u.get("status") == "failed"]
+            if uploading:
+                fields[f"{prefix}_status"] = "uploading"
+                avg_prog = sum(float(u.get("progress") or 0.0) for u in p_entries) / len(p_entries)
+                fields[f"{prefix}_progress"] = round(avg_prog, 3)
+            elif done:
+                fields[f"{prefix}_status"] = "done"
+                fields[f"{prefix}_progress"] = 1.0
+                last_id = next((u.get("id") for u in reversed(done) if u.get("id")), None)
+                if last_id:
+                    fields[f"{prefix}_id"] = last_id
+                fields[f"{prefix}_error"] = "; ".join(f.get("error") for f in failed if f.get("error"))[:500] if failed else None
+            elif failed:
+                fields[f"{prefix}_status"] = "failed"
+                fields[f"{prefix}_error"] = "; ".join(f.get("error") for f in failed if f.get("error"))[:500] or "Upload failed"
+
+        db.update("clips", clip_id, **fields)
 
 
 def start_upload(
@@ -234,11 +268,11 @@ def start_upload(
     acc = db.one("SELECT * FROM social_accounts WHERE id=? AND platform='youtube'", (account_id,)) if account_id else None
     acc_key = f"acc_{acc['id']}" if acc else "youtube_default"
     acc_name = acc["name"] if acc else "YouTube"
-    db.update("clips", clip_id, yt_status="uploading", yt_progress=0.0, yt_error=None)
     _update_clip_account_upload(clip_id, acc_key, {
         "account_id": acc["id"] if acc else None,
         "name": acc_name,
         "platform": "youtube",
+        "privacy": privacy,
         "status": "uploading",
         "progress": 0.0,
         "error": None,
@@ -255,17 +289,12 @@ def start_upload(
                 description,
                 tags,
                 privacy,
-                lambda f: (
-                    db.update("clips", clip_id, yt_progress=round(f, 3)),
-                    _update_clip_account_upload(clip_id, acc_key, {"progress": round(f, 3)}),
-                ),
+                lambda f: _update_clip_account_upload(clip_id, acc_key, {"progress": round(f, 3)}),
             )
-            db.update("clips", clip_id, yt_status="done", yt_progress=1.0, yt_id=vid_id, yt_error=None)
             _update_clip_account_upload(clip_id, acc_key, {"status": "done", "progress": 1.0, "id": vid_id, "error": None})
         except Exception as e:  # noqa: BLE001
             log.error("upload failed for clip %s: %s", clip_id, e)
             err_msg = str(e)[:500]
-            db.update("clips", clip_id, yt_status="failed", yt_error=err_msg)
             _update_clip_account_upload(clip_id, acc_key, {"status": "failed", "error": err_msg})
 
     threading.Thread(target=run, daemon=True).start()
@@ -275,11 +304,11 @@ def start_tiktok_upload(clip_id: int, title: str, privacy: str, account_id: int 
     acc = db.one("SELECT * FROM social_accounts WHERE id=? AND platform='tiktok'", (account_id,)) if account_id else None
     acc_key = f"acc_{acc['id']}" if acc else "tiktok_default"
     acc_name = acc["name"] if acc else "TikTok"
-    db.update("clips", clip_id, tiktok_status="uploading", tiktok_progress=0.0, tiktok_error=None)
     _update_clip_account_upload(clip_id, acc_key, {
         "account_id": acc["id"] if acc else None,
         "name": acc_name,
         "platform": "tiktok",
+        "privacy": (privacy or (acc.get("privacy") if acc else "INBOX") or "INBOX").upper(),
         "status": "uploading",
         "progress": 0.0,
         "error": None,
@@ -294,17 +323,12 @@ def start_tiktok_upload(clip_id: int, title: str, privacy: str, account_id: int 
                 c["path"],
                 title,
                 privacy,
-                lambda f: (
-                    db.update("clips", clip_id, tiktok_progress=round(f, 3)),
-                    _update_clip_account_upload(clip_id, acc_key, {"progress": round(f, 3)}),
-                ),
+                lambda f: _update_clip_account_upload(clip_id, acc_key, {"progress": round(f, 3)}),
             )
-            db.update("clips", clip_id, tiktok_status="done", tiktok_progress=1.0, tiktok_id=publish_id, tiktok_error=None)
             _update_clip_account_upload(clip_id, acc_key, {"status": "done", "progress": 1.0, "id": publish_id, "error": None})
         except Exception as e:  # noqa: BLE001
             log.error("TikTok upload failed for clip %s: %s", clip_id, e)
             err_msg = str(e)[:500]
-            db.update("clips", clip_id, tiktok_status="failed", tiktok_error=err_msg)
             _update_clip_account_upload(clip_id, acc_key, {"status": "failed", "error": err_msg})
 
     threading.Thread(target=run, daemon=True).start()
@@ -385,11 +409,13 @@ def _process_scheduled_upload(item: dict) -> None:
                             yt_desc = (yt_desc + "\n\n#Shorts").strip()
                     try:
                         _update_clip_account_upload(clip["id"], acc_key, {
-                            "account_id": acc_id, "name": acc_name, "platform": "youtube", "status": "uploading", "progress": 0.1
+                            "account_id": acc_id, "name": acc_name, "platform": "youtube", "privacy": yt_priv, "status": "uploading", "progress": 0.1, "error": None
                         })
-                        vid_id = youtube.upload(acc if acc_id else cfg, clip["path"], yt_title, yt_desc, yt_tags, yt_priv, lambda _f: None)
+                        vid_id = youtube.upload(
+                            acc if acc_id else cfg, clip["path"], yt_title, yt_desc, yt_tags, yt_priv,
+                            lambda f, _k=acc_key: _update_clip_account_upload(clip["id"], _k, {"progress": round(f, 3)}),
+                        )
                         results[res_key] = {"ok": True, "id": vid_id, "platform": "youtube", "name": acc_name, "account_id": acc_id}
-                        db.update("clips", clip["id"], yt_status="done", yt_progress=1.0, yt_id=vid_id, yt_error=None)
                         _update_clip_account_upload(clip["id"], acc_key, {
                             "status": "done", "progress": 1.0, "id": vid_id, "error": None
                         })
@@ -397,20 +423,21 @@ def _process_scheduled_upload(item: dict) -> None:
                         err_str = str(e)[:300]
                         results[res_key] = {"ok": False, "error": err_str, "platform": "youtube", "name": acc_name, "account_id": acc_id}
                         all_ok = False
-                        db.update("clips", clip["id"], yt_status="failed", yt_error=str(e)[:500])
                         _update_clip_account_upload(clip["id"], acc_key, {"status": "failed", "error": err_str})
 
                 elif plat == "tiktok":
                     tt_opts = opts.get(f"account_{acc_id}") or opts.get("tiktok") or {}
                     tt_title = tt_opts.get("title") or clip["title"]
-                    tt_priv = tt_opts.get("privacy") or acc.get("privacy") or "INBOX"
+                    tt_priv = (tt_opts.get("privacy") or acc.get("privacy") or "INBOX").upper()
                     try:
                         _update_clip_account_upload(clip["id"], acc_key, {
-                            "account_id": acc_id, "name": acc_name, "platform": "tiktok", "status": "uploading", "progress": 0.1
+                            "account_id": acc_id, "name": acc_name, "platform": "tiktok", "privacy": tt_priv, "status": "uploading", "progress": 0.1, "error": None
                         })
-                        pub_id = tiktok.upload(acc if acc_id else cfg, clip["path"], tt_title, tt_priv, lambda _f: None)
+                        pub_id = tiktok.upload(
+                            acc if acc_id else cfg, clip["path"], tt_title, tt_priv,
+                            lambda f, _k=acc_key: _update_clip_account_upload(clip["id"], _k, {"progress": round(f, 3)}),
+                        )
                         results[res_key] = {"ok": True, "id": pub_id, "platform": "tiktok", "name": acc_name, "account_id": acc_id}
-                        db.update("clips", clip["id"], tiktok_status="done", tiktok_progress=1.0, tiktok_id=pub_id, tiktok_error=None)
                         _update_clip_account_upload(clip["id"], acc_key, {
                             "status": "done", "progress": 1.0, "id": pub_id, "error": None
                         })
@@ -418,7 +445,6 @@ def _process_scheduled_upload(item: dict) -> None:
                         err_str = str(e)[:300]
                         results[res_key] = {"ok": False, "error": err_str, "platform": "tiktok", "name": acc_name, "account_id": acc_id}
                         all_ok = False
-                        db.update("clips", clip["id"], tiktok_status="failed", tiktok_error=str(e)[:500])
                         _update_clip_account_upload(clip["id"], acc_key, {"status": "failed", "error": err_str})
 
             status = "completed" if all_ok else ("failed" if not any(r.get("ok") for r in results.values()) else "partial")

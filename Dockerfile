@@ -1,10 +1,14 @@
 # ClipForge Dockerfile
 FROM python:3.11-slim-bookworm
 
-# Install system dependencies (ffmpeg is required for audio/video processing)
+# Install system dependencies (ffmpeg for audio/video, libglib2.0-0 and libgl1 for OpenCV face tracking)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
+    libglib2.0-0 \
+    libgl1 \
+    libsm6 \
+    libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set environment variables

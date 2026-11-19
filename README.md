@@ -79,10 +79,9 @@ ClipForge supports uploading directly or via **Inbox Draft Mode** using TikTok's
 2. Under Products, add **Login Kit** and **Content Posting API**. Leave **Upload to TikTok** enabled (this powers Inbox Draft mode).
 3. Under Login Kit, register your exact HTTPS callback URL (e.g. `https://your-tunnel-url/api/tiktok/callback`).
 4. Under **Roles & Access (Target Users)**, add up to 10 TikTok accounts you own and accept the developer terms on each account.
-5. In ClipForge Settings -> TikTok Accounts, click **+ Add TikTok Account / API**.
-6. Use the **same Sandbox Client Key & Secret** across all your TikTok accounts. Name each account so you can tell them apart.
-7. Click **Connect TikTok** for each row while logged into that account to save its authentication token.
-8. **Why Inbox Mode?** Unaudited apps cannot post public videos directly. Inbox mode sends the clip directly into your TikTok app inbox as an editable draft. You receive a notification on your phone and tap Post with full public visibility!
+5. In ClipForge Settings -> TikTok Accounts, enter your **Sandbox Client Key & Secret** once in the shared Developer App Credentials box and click **Save App Credentials**.
+6. Click **+ Connect TikTok Account** while logged into your TikTok account to authorize and save its token. To add more accounts, switch accounts in your browser and click **+ Connect Another TikTok Account**.
+7. **Why Inbox Mode?** Unaudited apps cannot post public videos directly. Inbox mode sends the clip directly into your TikTok app inbox as an editable draft. You receive a notification on your phone and tap Post with full public visibility!
 
 ## Where things are stored
 
@@ -128,6 +127,6 @@ WantedBy=multi-user.target
 
 ## Known limits
 
-- Framing mode "Follow the speaker" tracks one face at a time (OpenCV's frontal face detector). In a two-person shot it stays with the first face it finds. Use "Fit with blurred background" or "Center crop" for those.
+- Framing mode "Follow the speaker" uses OpenCV YuNet neural face detection (with Haar cascade fallback) and mouth-motion active-speaker switching. For simultaneous two-person view, choose "Stacked split-screen (2 speakers)", or configure an optional Vision Director model to automatically pick between speaker tracking, dual split-screen, gaming cam-stack, and graphic blur during rendering.
 - The language model decides what is a good clip. Small models are hit and miss, so treat the list as a shortlist and use the Preview button.
 - Only download and clip content you own or have permission to use.

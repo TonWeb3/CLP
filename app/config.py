@@ -19,7 +19,7 @@ DEFAULTS: dict = {
     "llm_api_key": "",
     "filter_model": "",  # pass 1: proposes moments in each transcript chunk
     "ranker_model": "",  # pass 2: ranks the shortlist
-    "vision_model": "",  # pass 3: visual director (analyzes keyframes for layout & framing)
+    "vision_model": "",  # render-time visual director (analyzes keyframes of selected clips for layout & framing)
     "llm_temperature": 0.2,
     "llm_num_ctx": 16384,
     "llm_disable_thinking": True,
@@ -37,7 +37,7 @@ DEFAULTS: dict = {
     "energy_weight": 0.15,
     # --- Rendering -------------------------------------------------------
     "aspect": "9:16",  # 9:16 | 1:1 | 4:5 | 16:9
-    "reframe": "face",  # face | split | center | blur
+    "reframe": "face",  # face | split | gaming | center | blur
     "captions": True,
     "caption_preset": "classic",  # classic | hormozi | mrbeast | minimalist
     "caption_emojis": True,

@@ -1,6 +1,7 @@
 """Cut a clip, reframe it, burn in captions, and encode it with ffmpeg."""
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 import tempfile
@@ -8,6 +9,8 @@ from pathlib import Path
 
 from .. import config
 from . import media
+
+log = logging.getLogger("clipforge.render")
 
 ASPECTS = {"9:16": (1080, 1920), "1:1": (1080, 1080), "4:5": (1080, 1350), "16:9": (1920, 1080)}
 
@@ -336,22 +339,6 @@ def build_ass(words: list[dict], clip_start: float, clip_end: float, W: int, H: 
 # --------------------------------------------------------------------------
 # Face tracking (Single & Multi-face split)
 # --------------------------------------------------------------------------
-def _rdp(points: list[tuple[float, float]], eps: float) -> list[tuple[float, float]]:
-    if len(points) < 3:
-        return points
-    (x1, y1), (x2, y2) = points[0], points[-1]
-    best, idx = 0.0, 0
-    for i in range(1, len(points) - 1):
-        x0, y0 = points[i]
-        t = (x0 - x1) / (x2 - x1) if x2 != x1 else 0
-        d = abs(y0 - (y1 + t * (y2 - y1)))
-        if d > best:
-            best, idx = d, i
-    if best > eps:
-        return _rdp(points[: idx + 1], eps)[:-1] + _rdp(points[idx:], eps)
-    return [points[0], points[-1]]
-
-
 def _load_yunet(cv2, input_size=(640, 360)):
     """Load OpenCV YuNet deep-learning face detector ONNX model."""
     if not hasattr(cv2, "FaceDetectorYN"):
@@ -471,21 +458,149 @@ def _detect_speaker_cands(cv2, frame, gray, scale, yunet, frontal, profile, body
     return cands
 
 
-def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w: int,
-              samples_per_sec: float = 4.0, vision_hints: dict | None = None) -> tuple[list[tuple[float, float]], tuple[int, int, int]] | None:
-    """Return (path, (cw, ch, crop_y)) or None if no speaker was found.
-    Features:
-    1. Vision Model Guidance: Receives visual composition directives to assist neural face tracking.
-    2. YuNet Neural Face Tracking + Cascades fallback: 99.5% detection across extreme angles and boom mics.
-    3. Broadcast Multi-Cam Switcher: Executes instant 0.04s broadcast hard cuts between speakers.
-    4. Active Speaker Auto-Cameraman: Detects mouth motion energy using exact YuNet landmarks.
-    5. Dynamic Edge-Centering (Digital Boundary Zoom): Centers speakers at X=540 without border wall clamping.
-    6. Occlusion Resilience: Holds speaker anchor across hand-on-chin / microphone drops.
-    7. B-roll / Graphic Protection: Drops to None if face coverage is under 20% to trigger aesthetic blur fit.
+def _detect_scene_segments(
+    src: str,
+    start: float,
+    end: float,
+    samples_per_sec: float = 2.0,
+    max_scenes: int = 8,
+) -> list[tuple[float, float]]:
+    """Scan the entire clip from start to end using OpenCV HSV histogram and edge-density change detection
+    to partition the clip into chronological visual scenes (e.g. camera angle cuts, image/slide popups,
+    screen shares, B-roll insertions). Returns list of (rel_start, rel_end) covering [0.0, dur].
     """
-    if vision_hints and vision_hints.get("has_onscreen_graphic"):
-        return None
+    dur = max(1.0, round(end - start, 3))
+    try:
+        import cv2
+    except ImportError:
+        return [(0.0, dur)]
 
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        return [(0.0, dur)]
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    step = 1.0 / samples_per_sec
+    frame_interval = max(1, int(round(fps / samples_per_sec)))
+    cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, start * 1000))
+
+    cut_points: list[float] = [0.0]
+    prev_hist = None
+    prev_edge_ratio = None
+    t = start
+
+    try:
+        while t < end:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            rel_t = round(max(0.0, t - start), 3)
+            small = cv2.resize(frame, (320, 180))
+            hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+            hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+            cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 80, 180)
+            edge_ratio = float((edges > 0).mean())
+
+            if prev_hist is not None and (rel_t - cut_points[-1]) >= 1.5 and (dur - rel_t) >= 1.2:
+                corr = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
+                edge_jump = abs(edge_ratio - (prev_edge_ratio or edge_ratio))
+                # Trigger a scene boundary on either a hard camera/image cut (corr < 0.58)
+                # or a sudden slide/graphic overlay pop-in (corr < 0.76 with high text/edge density shift)
+                if corr < 0.58 or (corr < 0.76 and edge_jump > 0.045):
+                    cut_points.append(rel_t)
+
+            prev_hist = hist
+            prev_edge_ratio = edge_ratio
+            t += step
+            for _ in range(frame_interval - 1):
+                if not cap.grab():
+                    break
+    finally:
+        cap.release()
+
+    # If the clip is long and had no hard cuts, divide into ~10s segments so the Master Vision Model still inspects the whole clip
+    if len(cut_points) == 1 and dur > 12.0:
+        n_div = min(4, max(2, int(round(dur / 10.0))))
+        cut_points = [round(i * dur / n_div, 3) for i in range(n_div)]
+
+    cut_points.append(dur)
+    segs: list[list[float]] = []
+    for s0, s1 in zip(cut_points[:-1], cut_points[1:]):
+        if s1 - s0 < 1.2 and segs:
+            segs[-1][1] = s1
+        else:
+            segs.append([s0, s1])
+
+    while len(segs) > max_scenes:
+        shortest_idx = min(range(len(segs) - 1), key=lambda i: (segs[i][1] - segs[i][0]) + (segs[i + 1][1] - segs[i + 1][0]))
+        segs[shortest_idx][1] = segs[shortest_idx + 1][1]
+        segs.pop(shortest_idx + 1)
+
+    return [(round(s[0], 3), round(s[1], 3)) for s in segs]
+
+
+def _extract_scene_annotated_frames(
+    src: str,
+    clip_start: float,
+    scene_segs: list[tuple[float, float]],
+) -> tuple[list[str], list[str]]:
+    """Extract and annotate a representative keyframe for EVERY scene across the clip.
+    Draws a clear 'SCENE #k (t0s - t1s)' HUD badge on each frame so the Master Vision Model
+    knows the exact scene index and time span it is directing.
+    """
+    import base64
+    images_b64: list[str] = []
+    descriptions: list[str] = []
+
+    try:
+        import cv2
+        cap = cv2.VideoCapture(src)
+        if not cap.isOpened():
+            return [], []
+        try:
+            for idx, (s0, s1) in enumerate(scene_segs, 1):
+                mid_t = clip_start + (s0 + s1) / 2.0
+                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, mid_t * 1000))
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+                h_orig, w_orig = frame.shape[:2]
+                target_w = 640
+                target_h = max(240, int(round(h_orig * target_w / max(1, w_orig))))
+                small = cv2.resize(frame, (target_w, target_h))
+
+                label = f"SCENE {idx}: {s0:.1f}s - {s1:.1f}s"
+                cv2.rectangle(small, (8, 8), (275, 40), (0, 0, 0), -1)
+                cv2.putText(small, label, (16, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 230, 255), 2, cv2.LINE_AA)
+
+                ok_enc, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if ok_enc:
+                    images_b64.append(base64.b64encode(buf.tobytes()).decode("utf-8"))
+                    descriptions.append(f"- Scene {idx} ({s0:.1f}s to {s1:.1f}s, duration {s1 - s0:.1f}s)")
+        finally:
+            cap.release()
+    except Exception as e:
+        log.warning("OpenCV scene frame extraction failed: %s", e)
+
+    return images_b64, descriptions
+
+
+def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w: int,
+              samples_per_sec: float = 4.0, vision_hints: dict | None = None) -> tuple[list[tuple[float, float]], tuple[int, int, int], list[tuple[float, float]]] | None:
+    """Return (path, (cw, ch, crop_y), blur_intervals) or None if the entire clip should use blur/graphic layout.
+    Features:
+    1. Master Vision Director Control: Follows per-scene layout, focus_side, tracking_style, and ignore_background_faces directives.
+    2. Automatic Mid-Clip Graphic/Image Protection: Whenever a scene is marked 'blur' or 'has_graphic' by the Vision Director,
+       OR when faces disappear for >= 1.25s (e.g. an image, B-roll, chart, or screen share pops up mid-clip),
+       records the exact (t_start, t_end) interval in `blur_intervals` so FFmpeg dynamically switches to full-frame blurred fit
+       during that moment and returns to face-tracking right after!
+    3. YuNet Neural Face Tracking + Cascades fallback: 99.5% detection across extreme angles and boom mics.
+    4. Broadcast Multi-Cam Switcher: Executes instant 0.04s broadcast hard cuts between speakers.
+    5. Active Speaker Auto-Cameraman: Detects mouth motion energy using exact YuNet landmarks.
+    """
     try:
         import cv2
     except ImportError:
@@ -502,8 +617,18 @@ def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w
     if not cap.isOpened():
         return None
 
+    tracking_style = (vision_hints or {}).get("tracking_style") or "active_speaker"
+    ignore_bg_faces = bool((vision_hints or {}).get("ignore_background_faces", False))
+    scene_directives: list[dict] = (vision_hints or {}).get("scene_timeline") or []
+
+    def scene_at(rel_t: float) -> dict | None:
+        for sc in scene_directives:
+            if sc["start"] - 0.05 <= rel_t <= sc["end"] + 0.05:
+                return sc
+        return None
+
     scale = det_w / src_w if src_w > det_w else 1.0
-    raw: list[tuple[float, float | None, float | None]] = []
+    raw: list[tuple[float, float | None, float | None, bool]] = []
     t = start
     step = 1.0 / samples_per_sec
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -532,6 +657,11 @@ def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w
             ok, frame = cap.read()
             if not ok:
                 break
+            rel_t = round(max(0.0, t - start), 3)
+            cur_scene = scene_at(rel_t)
+            scene_wants_blur = bool(cur_scene and (cur_scene.get("layout") == "blur" or cur_scene.get("has_graphic")))
+            scene_focus = (cur_scene.get("focus_side") if cur_scene else None) or "auto"
+
             small = cv2.resize(frame, None, fx=scale, fy=scale) if scale != 1.0 else frame
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
@@ -544,105 +674,123 @@ def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w
                 corr = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
                 if corr < 0.52:
                     is_shot_cut = True
-                    shot_cuts.append(round(t - start, 3))
+                    shot_cuts.append(rel_t)
                     side_switch_hold = 0
             prev_hist = hist
 
             cands = _detect_speaker_cands(cv2, small, gray, scale, yunet, frontal, profile, body)
+            if cands and (ignore_bg_faces or tracking_style == "lock_primary"):
+                max_area = max(c["area"] for c in cands)
+                # Filter out small background faces / posters / images behind the speaker
+                cands = [c for c in cands if c["area"] >= max_area * 0.45]
+
             cx, cy = None, None
-            if cands:
-                left_cands = [c for c in cands if c["cx"] < mid_x]
-                right_cands = [c for c in cands if c["cx"] >= mid_x]
-
-                if left_cands and right_cands:
-                    best_l = max(left_cands, key=lambda c: c["area"])
-                    best_r = max(right_cands, key=lambda c: c["area"])
-
-                    m_l, m_r = 0.0, 0.0
-                    if prev_gray is not None:
-                        for spk, cand_item in (("l", best_l), ("r", best_r)):
-                            if cand_item.get("mouth"):
-                                mx, my = cand_item["mouth"]
-                            else:
-                                sx, sy = int(cand_item["cx"] * scale), int(cand_item["cy"] * scale)
-                                mx = max(0, min(gray.shape[1] - 24, sx))
-                                my = max(0, min(gray.shape[0] - 15, sy + 6))
-                            y1 = max(0, my - 8)
-                            y2 = min(gray.shape[0], my + 8)
-                            x1 = max(0, mx - 12)
-                            x2 = min(gray.shape[1], mx + 12)
-                            if y2 > y1 and x2 > x1:
-                                diff = float(cv2.absdiff(gray[y1:y2, x1:x2], prev_gray[y1:y2, x1:x2]).mean())
-                                if spk == "l":
-                                    m_l = diff
-                                else:
-                                    m_r = diff
-
-                    ema_l_motion = 0.35 * m_l + 0.65 * ema_l_motion
-                    ema_r_motion = 0.35 * m_r + 0.65 * ema_r_motion
-
-                    if ema_l_motion > ema_r_motion * 1.30:
-                        desired_side = "left"
-                    elif ema_r_motion > ema_l_motion * 1.30:
-                        desired_side = "right"
-                    else:
-                        desired_side = active_side or "left"
-
-                    if desired_side != active_side:
-                        side_switch_hold += 1
-                        threshold = 2 if is_shot_cut else 4
-                        if side_switch_hold >= threshold or active_side is None:
-                            if active_side is not None and desired_side != active_side:
-                                # Virtual Multi-Camera Hard Cut: instant angle switch between speakers
-                                shot_cuts.append(round(t - start, 3))
-                            active_side = desired_side
-                            side_switch_hold = 0
-                    else:
-                        side_switch_hold = 0
-
-                    chosen = best_l if active_side == "left" else best_r
-                    cx = chosen["cx"]
-                    cy = chosen["cy"]
-                    prev_cx = cx
-                    prev_cy = cy
+            if scene_wants_blur:
+                # Master Vision Director flagged this scene as an on-screen image/slide/graphic
+                lost_count = 0
+            elif cur_scene and cur_scene.get("layout") == "center":
+                cx, cy = mid_x, src_h * 0.38
+                prev_cx, prev_cy = cx, cy
+                lost_count = 0
+            elif cands:
+                if scene_focus == "left":
+                    side_cands = [c for c in cands if c["cx"] < mid_x] or cands
+                    chosen = max(side_cands, key=lambda c: c["area"])
+                    cx, cy = chosen["cx"], chosen["cy"]
+                    prev_cx, prev_cy = cx, cy
+                    active_side = "left"
+                    lost_count = 0
+                elif scene_focus == "right":
+                    side_cands = [c for c in cands if c["cx"] >= mid_x] or cands
+                    chosen = max(side_cands, key=lambda c: c["area"])
+                    cx, cy = chosen["cx"], chosen["cy"]
+                    prev_cx, prev_cy = cx, cy
+                    active_side = "right"
                     lost_count = 0
                 else:
-                    if prev_cx is None or is_shot_cut:
-                        chosen = max(cands, key=lambda c: c["area"])
-                        cx = chosen["cx"]
-                        cy = chosen["cy"]
-                        prev_cx = cx
-                        prev_cy = cy
+                    left_cands = [c for c in cands if c["cx"] < mid_x]
+                    right_cands = [c for c in cands if c["cx"] >= mid_x]
+
+                    if left_cands and right_cands and tracking_style != "lock_primary":
+                        best_l = max(left_cands, key=lambda c: c["area"])
+                        best_r = max(right_cands, key=lambda c: c["area"])
+
+                        m_l, m_r = 0.0, 0.0
+                        if prev_gray is not None:
+                            for spk, cand_item in (("l", best_l), ("r", best_r)):
+                                if cand_item.get("mouth"):
+                                    mx, my = cand_item["mouth"]
+                                else:
+                                    sx, sy = int(cand_item["cx"] * scale), int(cand_item["cy"] * scale)
+                                    mx = max(0, min(gray.shape[1] - 24, sx))
+                                    my = max(0, min(gray.shape[0] - 15, sy + 6))
+                                y1 = max(0, my - 8)
+                                y2 = min(gray.shape[0], my + 8)
+                                x1 = max(0, mx - 12)
+                                x2 = min(gray.shape[1], mx + 12)
+                                if y2 > y1 and x2 > x1:
+                                    diff = float(cv2.absdiff(gray[y1:y2, x1:x2], prev_gray[y1:y2, x1:x2]).mean())
+                                    if spk == "l":
+                                        m_l = diff
+                                    else:
+                                        m_r = diff
+
+                        ema_l_motion = 0.35 * m_l + 0.65 * ema_l_motion
+                        ema_r_motion = 0.35 * m_r + 0.65 * ema_r_motion
+
+                        if ema_l_motion > ema_r_motion * 1.30:
+                            desired_side = "left"
+                        elif ema_r_motion > ema_l_motion * 1.30:
+                            desired_side = "right"
+                        else:
+                            desired_side = active_side or "left"
+
+                        if desired_side != active_side:
+                            side_switch_hold += 1
+                            threshold = 2 if is_shot_cut else 4
+                            if side_switch_hold >= threshold or active_side is None:
+                                if active_side is not None and desired_side != active_side:
+                                    shot_cuts.append(rel_t)
+                                active_side = desired_side
+                                side_switch_hold = 0
+                        else:
+                            side_switch_hold = 0
+
+                        chosen = best_l if active_side == "left" else best_r
+                        cx, cy = chosen["cx"], chosen["cy"]
+                        prev_cx, prev_cy = cx, cy
                         lost_count = 0
                     else:
-                        near = [c for c in cands if abs(c["cx"] - prev_cx) < crop_w * 0.6]
-                        if near:
-                            chosen = min(near, key=lambda c: abs(c["cx"] - prev_cx))
-                            cx = chosen["cx"]
-                            cy = chosen["cy"]
-                            prev_cx = cx
-                            prev_cy = cy
+                        if prev_cx is None or is_shot_cut:
+                            chosen = max(cands, key=lambda c: c["area"])
+                            cx, cy = chosen["cx"], chosen["cy"]
+                            prev_cx, prev_cy = cx, cy
                             lost_count = 0
                         else:
-                            lost_count += 1
-                            if lost_count >= 6:
-                                chosen = max(cands, key=lambda c: c["area"])
-                                cx = chosen["cx"]
-                                cy = chosen["cy"]
-                                prev_cx = cx
-                                prev_cy = cy
+                            near = [c for c in cands if abs(c["cx"] - prev_cx) < crop_w * 0.6]
+                            if near:
+                                chosen = min(near, key=lambda c: abs(c["cx"] - prev_cx))
+                                cx, cy = chosen["cx"], chosen["cy"]
+                                prev_cx, prev_cy = cx, cy
                                 lost_count = 0
                             else:
-                                cx = prev_cx
-                                cy = prev_cy
+                                lost_count += 1
+                                if lost_count >= 6:
+                                    chosen = max(cands, key=lambda c: c["area"])
+                                    cx, cy = chosen["cx"], chosen["cy"]
+                                    prev_cx, prev_cy = cx, cy
+                                    lost_count = 0
+                                else:
+                                    cx, cy = prev_cx, prev_cy
             elif prev_cx is not None and not is_shot_cut:
                 lost_count += 1
-                if lost_count < 10:
-                    cx = prev_cx
-                    cy = prev_cy
+                # Hold position across brief 1.0s occlusions (4 samples), but if faces vanish longer
+                # (e.g. a full-screen image/slide/B-roll appeared), leave cx=None so dynamic blur protection triggers
+                if lost_count <= 4:
+                    cx, cy = prev_cx, prev_cy
 
             prev_gray = gray
-            raw.append((t - start, cx, cy))
+            raw.append((rel_t, cx, cy, scene_wants_blur))
             t += step
             for _ in range(frame_interval - 1):
                 if not cap.grab():
@@ -650,9 +798,41 @@ def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w
     finally:
         cap.release()
 
-    valid = [(tt, c, cy_val) for tt, c, cy_val in raw if c is not None]
-    if not valid or len(valid) < max(2, int(len(raw) * 0.20)):
+    valid = [(tt, c, cy_val) for tt, c, cy_val, is_b in raw if c is not None and not is_b]
+    if not valid or len(valid) < max(2, int(len(raw) * 0.15)):
         return None
+
+    # Build dynamic blur intervals for any time range where:
+    # 1) The Master Vision Director ordered 'blur' / 'has_graphic', OR
+    # 2) No face was present for >= 1.25 seconds (e.g. an image, chart, or B-roll cutaway appeared mid-clip)
+    blur_intervals: list[tuple[float, float]] = []
+    for sc in scene_directives:
+        if sc.get("layout") == "blur" or sc.get("has_graphic"):
+            blur_intervals.append((float(sc["start"]), float(sc["end"])))
+
+    no_face_start: float | None = None
+    for idx, (tt, c, _, is_b) in enumerate(raw):
+        if c is None or is_b:
+            if no_face_start is None:
+                no_face_start = tt
+        else:
+            if no_face_start is not None:
+                if tt - no_face_start >= 1.25:
+                    blur_intervals.append((round(no_face_start, 3), round(tt, 3)))
+                no_face_start = None
+    if no_face_start is not None and (end - start) - no_face_start >= 1.25:
+        blur_intervals.append((round(no_face_start, 3), round(end - start, 3)))
+
+    # Merge overlapping blur intervals
+    merged_blur: list[list[float]] = []
+    for b0, b1 in sorted(blur_intervals):
+        if b1 - b0 < 0.8:
+            continue
+        if not merged_blur or b0 - merged_blur[-1][1] > 0.4:
+            merged_blur.append([max(0.0, round(b0, 3)), min(round(end - start, 3), round(b1, 3))])
+        else:
+            merged_blur[-1][1] = max(merged_blur[-1][1], min(round(end - start, 3), round(b1, 3)))
+    final_blur_intervals = [(b[0], b[1]) for b in merged_blur]
 
     # Calculate speaker clearances from boundaries to compute adaptive boundary zoom
     left_xs = [c for _, c, _ in valid if c < mid_x]
@@ -686,20 +866,21 @@ def face_path(src: str, start: float, end: float, src_w: int, src_h: int, crop_w
     # Fill missing frames: if speaker is momentarily occluded, stay locked on their position
     filled: list[tuple[float, float]] = []
     last = valid[0][1] if valid else mid_x
-    for tt, c, _ in raw:
+    for tt, c, _, _ in raw:
         if c is not None:
             last = c
         filled.append((tt, last))
 
-    path = _build_cinematic_path(filled, cw, src_w, end - start, cut_times=shot_cuts)
-    return path, (cw, ch, crop_y)
+    path = _build_cinematic_path(filled, cw, src_w, end - start, cut_times=shot_cuts, tracking_style=tracking_style)
+    return path, (cw, ch, crop_y), final_blur_intervals
 
 
 def _build_cinematic_path(raw_points: list[tuple[float, float]], crop_w: int, src_w: int, duration: float,
-                          cut_times: list[float] | None = None) -> list[tuple[float, float]]:
+                          cut_times: list[float] | None = None,
+                          tracking_style: str = "active_speaker") -> list[tuple[float, float]]:
     """Convert raw face tracking points into a stabilized cinematic camera track.
-    Executes instant hard cuts on broadcast camera angle switches, and silky-smooth
-    eased pans when speakers move within a continuous shot.
+    Executes instant hard cuts (0.04s) on broadcast camera angle switches or speaker cuts,
+    and silky-smooth eased pans (0.32s - 0.50s) when a speaker moves within a continuous shot.
     """
     if not raw_points:
         return []
@@ -715,11 +896,11 @@ def _build_cinematic_path(raw_points: list[tuple[float, float]], crop_w: int, sr
         med.append(win[len(win) // 2])
 
     ema = [med[0]]
-    alpha = 0.18
+    alpha = 0.14 if tracking_style == "smooth_follow" else 0.18
     for val in med[1:]:
         ema.append(alpha * val + (1.0 - alpha) * ema[-1])
 
-    deadband = crop_w * 0.22
+    deadband = crop_w * (0.16 if tracking_style == "smooth_follow" else 0.22)
     cam_center = ema[0]
     initial_crop_x = float(min(max(cam_center - half, 0), max_x))
     anchors = [(0.0, round(initial_crop_x, 1))]
@@ -731,9 +912,11 @@ def _build_cinematic_path(raw_points: list[tuple[float, float]], crop_w: int, sr
         diff = target - cam_center
 
         if abs(diff) > deadband:
-            # Broadcast Multi-Cam Switcher: Instant cut (0.04s) to the active speaker
-            # Completely eliminates awkward camera sliding/panning across podcast tables
-            pan_duration = 0.04
+            near_cut = any(abs(tt - ct) <= 0.45 for ct in cuts)
+            if tracking_style == "smooth_follow" and not near_cut:
+                pan_duration = 0.45
+            else:
+                pan_duration = 0.04 if (near_cut or abs(diff) > crop_w * 0.45) else 0.32
             pan_start_t = max(0.0, tt)
             pan_end_t = min(round(duration, 3), round(pan_start_t + pan_duration, 3))
             if pan_end_t <= pan_start_t:
@@ -887,6 +1070,8 @@ def detect_gaming_layout(src: str, start: float, end: float, src_w: int, src_h: 
                          tw: int = 1080, th: int = 1920,
                          webcam_hint: str | None = None) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]] | None:
     """Detects streamer facecam corner box and center gameplay box for 9:16 Gaming Cam-Stack layout.
+    Clusters face detections across 8 timestamps so stationary corner webcam overlays are locked onto
+    and moving in-game 3D character faces are ignored.
     Returns ((cam_cw, cam_ch, cam_x, cam_y), (game_cw, game_ch, game_x, game_y)) or None.
     """
     try:
@@ -907,7 +1092,7 @@ def detect_gaming_layout(src: str, start: float, end: float, src_w: int, src_h: 
 
     scale = det_w / src_w if src_w > det_w else 1.0
     dur = max(1.0, end - start)
-    sample_times = [start + dur * 0.15, start + dur * 0.40, start + dur * 0.65, start + dur * 0.85]
+    sample_times = [start + dur * (i / 9.0) for i in range(1, 9)]
     all_face_cands: list[dict] = []
 
     try:
@@ -920,14 +1105,16 @@ def detect_gaming_layout(src: str, start: float, end: float, src_w: int, src_h: 
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
             cands = _detect_speaker_cands(cv2, small, gray, scale, yunet, frontal, profile, body)
             for c in cands:
-                all_face_cands.append(c)
+                # Ignore giant center-screen faces (in-game cutscene characters or full-screen facecam)
+                if c["area"] < (src_w * src_h * 0.22):
+                    all_face_cands.append(c)
     finally:
         cap.release()
 
     if not all_face_cands:
         return None
 
-    # Filter by webcam quadrant hint if provided by vision model
+    # Filter by webcam quadrant hint if provided by Master Vision Director
     filtered = all_face_cands
     mid_x = src_w / 2
     mid_y = src_h / 2
@@ -940,15 +1127,30 @@ def detect_gaming_layout(src: str, start: float, end: float, src_w: int, src_h: 
     elif webcam_hint == "top_left":
         filtered = [c for c in all_face_cands if c["cx"] < mid_x and c["cy"] < mid_y] or all_face_cands
 
-    best_face = max(filtered, key=lambda c: c["area"])
-    fc_x, fc_y = best_face["cx"], best_face["cy"]
+    # Cluster detections by spatial proximity: a streamer webcam stays in a fixed overlay box across frames
+    best_cluster: list[dict] = []
+    radius_x = src_w * 0.08
+    radius_y = src_h * 0.08
+    for cand in filtered:
+        neighbors = [
+            other for other in filtered
+            if abs(other["cx"] - cand["cx"]) <= radius_x and abs(other["cy"] - cand["cy"]) <= radius_y
+        ]
+        # Prefer clusters near the left/right edges (where streamer webcam boxes live) with consistent detections
+        if len(neighbors) > len(best_cluster):
+            best_cluster = neighbors
+
+    cluster = best_cluster if best_cluster else filtered
+    fc_x = sorted(c["cx"] for c in cluster)[len(cluster) // 2]
+    fc_y = sorted(c["cy"] for c in cluster)[len(cluster) // 2]
+    med_area = sorted(c["area"] for c in cluster)[len(cluster) // 2]
 
     cam_h = int(round(th * 0.36))
     cam_h -= cam_h % 2
     game_h = th - cam_h
 
     cam_ar = tw / cam_h
-    face_dim = (best_face["area"] ** 0.5) if best_face.get("area") else (src_h * 0.15)
+    face_dim = (med_area ** 0.5) if med_area else (src_h * 0.15)
     cam_cw = int(round(max(face_dim * 2.8, src_w * 0.22)))
     cam_cw -= cam_cw % 2
     cam_ch = int(round(cam_cw / cam_ar))
@@ -1016,7 +1218,7 @@ def _subs_filter(has_subs: bool, in_label: str, out_label: str) -> str:
     font_files = [f for f in fonts.iterdir() if f.is_file() and f.suffix.lower() in (".ttf", ".otf", ".woff", ".woff2")] if fonts.is_dir() else []
     if font_files:
         esc_dir = _esc(str(fonts).replace("\\", "/"))
-        opt = f":fontsdir='{esc_dir}'"
+        opt = f":fontsdir={esc_dir}"
     return f"[{in_label}]ass=subs.ass{opt}[{out_label}]"
 
 
@@ -1025,13 +1227,19 @@ def build_graph(mode: str, aspect: str, src_w: int, src_h: int, tw: int, th: int
                 split_paths: tuple | None = None, gaming_boxes: tuple | None = None,
                 dynamic_zoom: bool = True,
                 keep_segs: list[tuple[float, float]] | None = None,
-                crop_box: tuple[int, int, int] | None = None) -> str:
-    """Return a -filter_complex graph taking [0:v] and producing [v]."""
+                crop_box: tuple[int, int, int] | None = None,
+                blur_intervals: list[tuple[float, float]] | None = None,
+                scene_timeline: list[dict] | None = None) -> str:
+    """Return a -filter_complex graph taking [0:v] and producing [v].
+    Supports Master Vision Director dynamic mid-clip layout switching (e.g. face -> blur -> split -> face)
+    so when an image, slide, screen share, or dual-speaker shot appears mid-clip, the layout switches cleanly.
+    """
     if aspect == "16:9":
         base = (f"[0:v]scale={tw}:{th}:force_original_aspect_ratio=decrease,"
                 f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,setsar=1[v_raw]")
     elif mode == "gaming" and aspect == "9:16":
         # Viral Gaming Cam-Stack: Streamer facecam on top (36%) + Center gameplay action on bottom (64%)
+        # Also supports dynamic mid-clip switching to full-screen speaker ('face') or wide scoreboard/menu ('blur')
         cam_h = int(round(th * 0.36))
         cam_h -= cam_h % 2
         game_h = th - cam_h
@@ -1042,13 +1250,67 @@ def build_graph(mode: str, aspect: str, src_w: int, src_h: int, tw: int, th: int
             cam_cw, cam_ch, cam_x, cam_y = (src_w // 2, src_h // 2, src_w // 4, src_h // 4)
             game_cw, game_ch, game_x, game_y = (src_w, src_h, 0, 0)
 
-        base = (
-            f"[0:v]split=2[raw_cam][raw_game];"
-            f"[raw_cam]crop={cam_cw}:{cam_ch}:{cam_x}:{cam_y},scale={tw}:{cam_h}:flags=lanczos,setsar=1[cam];"
-            f"[raw_game]crop={game_cw}:{game_ch}:{game_x}:{game_y},scale={tw}:{game_h}:flags=lanczos,setsar=1[game];"
-            f"[cam][game]vstack=inputs=2[stacked];"
-            f"[stacked]drawbox=y={cam_h - 2}:color=black@0.85:width=iw:height=4:t=fill[v_raw]"
-        )
+        face_intervals = [
+            (float(sc["start"]), float(sc["end"]))
+            for sc in (scene_timeline or [])
+            if sc.get("layout") == "face" and float(sc["end"]) - float(sc["start"]) >= 1.0
+        ]
+        use_mid_face = bool(face_intervals)
+        if crop_box:
+            f_cw, f_ch, f_cy = crop_box
+        else:
+            f_cw, f_ch, f_cy = crop_w - (crop_w % 2), src_h - (src_h % 2), 0
+        f_max_x = max(0, src_w - f_cw)
+        f_x = f"min(max({_lerp_expr(path)},0),{f_max_x})" if path else f"{f_max_x // 2}"
+
+        if blur_intervals and use_mid_face:
+            b_expr = "+".join(f"between(t,{b0:.3f},{b1:.3f})" for b0, b1 in blur_intervals)
+            f_expr = "+".join(f"between(t,{f0:.3f},{f1:.3f})" for f0, f1 in face_intervals)
+            base = (
+                f"[0:v]split=5[raw_cam][raw_game][vf][ba][bb];"
+                f"[raw_cam]crop={cam_cw}:{cam_ch}:{cam_x}:{cam_y},scale={tw}:{cam_h}:flags=lanczos,setsar=1[cam];"
+                f"[raw_game]crop={game_cw}:{game_ch}:{game_x}:{game_y},scale={tw}:{game_h}:flags=lanczos,setsar=1[game];"
+                f"[cam][game]vstack=inputs=2[stacked];"
+                f"[stacked]drawbox=y={cam_h - 2}:color=black@0.85:width=iw:height=4:t=fill[v_game];"
+                f"[vf]crop={f_cw}:{f_ch}:x='{f_x}':y={f_cy},scale={tw}:{th}:flags=lanczos,setsar=1[v_face];"
+                f"[ba]scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th},boxblur=28:3[bg];"
+                f"[bb]scale={tw}:{th}:force_original_aspect_ratio=decrease[fg];"
+                f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v_blur];"
+                f"[v_game][v_face]overlay=0:0:enable='{f_expr}'[v_gf];"
+                f"[v_gf][v_blur]overlay=0:0:enable='{b_expr}',setsar=1[v_raw]"
+            )
+        elif blur_intervals:
+            b_expr = "+".join(f"between(t,{b0:.3f},{b1:.3f})" for b0, b1 in blur_intervals)
+            base = (
+                f"[0:v]split=4[raw_cam][raw_game][ba][bb];"
+                f"[raw_cam]crop={cam_cw}:{cam_ch}:{cam_x}:{cam_y},scale={tw}:{cam_h}:flags=lanczos,setsar=1[cam];"
+                f"[raw_game]crop={game_cw}:{game_ch}:{game_x}:{game_y},scale={tw}:{game_h}:flags=lanczos,setsar=1[game];"
+                f"[cam][game]vstack=inputs=2[stacked];"
+                f"[stacked]drawbox=y={cam_h - 2}:color=black@0.85:width=iw:height=4:t=fill[v_game];"
+                f"[ba]scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th},boxblur=28:3[bg];"
+                f"[bb]scale={tw}:{th}:force_original_aspect_ratio=decrease[fg];"
+                f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v_blur];"
+                f"[v_game][v_blur]overlay=0:0:enable='{b_expr}',setsar=1[v_raw]"
+            )
+        elif use_mid_face:
+            f_expr = "+".join(f"between(t,{f0:.3f},{f1:.3f})" for f0, f1 in face_intervals)
+            base = (
+                f"[0:v]split=3[raw_cam][raw_game][vf];"
+                f"[raw_cam]crop={cam_cw}:{cam_ch}:{cam_x}:{cam_y},scale={tw}:{cam_h}:flags=lanczos,setsar=1[cam];"
+                f"[raw_game]crop={game_cw}:{game_ch}:{game_x}:{game_y},scale={tw}:{game_h}:flags=lanczos,setsar=1[game];"
+                f"[cam][game]vstack=inputs=2[stacked];"
+                f"[stacked]drawbox=y={cam_h - 2}:color=black@0.85:width=iw:height=4:t=fill[v_game];"
+                f"[vf]crop={f_cw}:{f_ch}:x='{f_x}':y={f_cy},scale={tw}:{th}:flags=lanczos,setsar=1[v_face];"
+                f"[v_game][v_face]overlay=0:0:enable='{f_expr}',setsar=1[v_raw]"
+            )
+        else:
+            base = (
+                f"[0:v]split=2[raw_cam][raw_game];"
+                f"[raw_cam]crop={cam_cw}:{cam_ch}:{cam_x}:{cam_y},scale={tw}:{cam_h}:flags=lanczos,setsar=1[cam];"
+                f"[raw_game]crop={game_cw}:{game_ch}:{game_x}:{game_y},scale={tw}:{game_h}:flags=lanczos,setsar=1[game];"
+                f"[cam][game]vstack=inputs=2[stacked];"
+                f"[stacked]drawbox=y={cam_h - 2}:color=black@0.85:width=iw:height=4:t=fill[v_raw]"
+            )
     elif mode == "split" and aspect == "9:16":
         # Two stacked frames: Top speaker + Bottom speaker
         top_h = th // 2
@@ -1073,13 +1335,27 @@ def build_graph(mode: str, aspect: str, src_w: int, src_h: int, tw: int, th: int
         x_top = f"min(max({_lerp_expr(p_left)},0),{max_top_x})" if p_left else f"{max_top_x // 2}"
         x_bot = f"min(max({_lerp_expr(p_right)},0),{max_bot_x})" if p_right else f"{max_bot_x // 2}"
 
-        base = (
-            f"[0:v]split=2[sp1][sp2];"
-            f"[sp1]crop={cw_top}:{ch_top}:x='{x_top}':y={y_top},scale={tw}:{top_h}:flags=lanczos,setsar=1[top];"
-            f"[sp2]crop={cw_bot}:{ch_bot}:x='{x_bot}':y={y_bot},scale={tw}:{bot_h}:flags=lanczos,setsar=1[bot];"
-            f"[top][bot]vstack=inputs=2[stacked];"
-            f"[stacked]drawbox=y={top_h - 2}:color=black@0.75:width=iw:height=4:t=fill[v_raw]"
-        )
+        if blur_intervals:
+            b_expr = "+".join(f"between(t,{b0:.3f},{b1:.3f})" for b0, b1 in blur_intervals)
+            base = (
+                f"[0:v]split=4[sp1][sp2][ba][bb];"
+                f"[sp1]crop={cw_top}:{ch_top}:x='{x_top}':y={y_top},scale={tw}:{top_h}:flags=lanczos,setsar=1[top];"
+                f"[sp2]crop={cw_bot}:{ch_bot}:x='{x_bot}':y={y_bot},scale={tw}:{bot_h}:flags=lanczos,setsar=1[bot];"
+                f"[top][bot]vstack=inputs=2[stacked];"
+                f"[stacked]drawbox=y={top_h - 2}:color=black@0.75:width=iw:height=4:t=fill[v_split];"
+                f"[ba]scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th},boxblur=28:3[bg];"
+                f"[bb]scale={tw}:{th}:force_original_aspect_ratio=decrease[fg];"
+                f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v_blur];"
+                f"[v_split][v_blur]overlay=0:0:enable='{b_expr}',setsar=1[v_raw]"
+            )
+        else:
+            base = (
+                f"[0:v]split=2[sp1][sp2];"
+                f"[sp1]crop={cw_top}:{ch_top}:x='{x_top}':y={y_top},scale={tw}:{top_h}:flags=lanczos,setsar=1[top];"
+                f"[sp2]crop={cw_bot}:{ch_bot}:x='{x_bot}':y={y_bot},scale={tw}:{bot_h}:flags=lanczos,setsar=1[bot];"
+                f"[top][bot]vstack=inputs=2[stacked];"
+                f"[stacked]drawbox=y={top_h - 2}:color=black@0.75:width=iw:height=4:t=fill[v_raw]"
+            )
     elif mode == "blur" or crop_w > src_w:
         base = (f"[0:v]split=2[a][b];"
                 f"[a]scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th},boxblur=28:3[bg];"
@@ -1097,12 +1373,82 @@ def build_graph(mode: str, aspect: str, src_w: int, src_h: int, tw: int, th: int
             x = f"min(max({_lerp_expr(path)},0),{max_x})"
         else:
             x = f"{max_x // 2}"
-        base = f"[0:v]crop={cw}:{ch}:x='{x}':y={cy},scale={tw}:{th}:flags=lanczos,setsar=1[v_raw]"
+
+        split_intervals = [
+            (float(sc["start"]), float(sc["end"]))
+            for sc in (scene_timeline or [])
+            if sc.get("layout") == "split" and float(sc["end"]) - float(sc["start"]) >= 1.0
+        ]
+        use_mid_split = bool(split_intervals and split_paths and aspect == "9:16")
+
+        if blur_intervals and use_mid_split:
+            b_expr = "+".join(f"between(t,{b0:.3f},{b1:.3f})" for b0, b1 in blur_intervals)
+            s_expr = "+".join(f"between(t,{s0:.3f},{s1:.3f})" for s0, s1 in split_intervals)
+            top_h = th // 2
+            bot_h = th - top_h
+            p_left, p_right, box_top, box_bot = split_paths if len(split_paths) == 4 else (*split_paths[:2], None, None)
+            split_crop_w = min(src_w, int(round(src_h * tw / top_h)) - (int(round(src_h * tw / top_h)) % 2))
+            default_ch = src_h - (src_h % 2)
+            cw_top, ch_top, y_top = box_top if box_top else (split_crop_w, default_ch, 0)
+            cw_bot, ch_bot, y_bot = box_bot if box_bot else (split_crop_w, default_ch, 0)
+            max_top_x = max(0, src_w - cw_top)
+            max_bot_x = max(0, src_w - cw_bot)
+            x_top = f"min(max({_lerp_expr(p_left)},0),{max_top_x})" if p_left else f"{max_top_x // 2}"
+            x_bot = f"min(max({_lerp_expr(p_right)},0),{max_bot_x})" if p_right else f"{max_bot_x // 2}"
+
+            base = (
+                f"[0:v]split=5[vf][sp1][sp2][ba][bb];"
+                f"[vf]crop={cw}:{ch}:x='{x}':y={cy},scale={tw}:{th}:flags=lanczos,setsar=1[v_face];"
+                f"[sp1]crop={cw_top}:{ch_top}:x='{x_top}':y={y_top},scale={tw}:{top_h}:flags=lanczos,setsar=1[top];"
+                f"[sp2]crop={cw_bot}:{ch_bot}:x='{x_bot}':y={y_bot},scale={tw}:{bot_h}:flags=lanczos,setsar=1[bot];"
+                f"[top][bot]vstack=inputs=2[stacked];"
+                f"[stacked]drawbox=y={top_h - 2}:color=black@0.75:width=iw:height=4:t=fill[v_split];"
+                f"[ba]scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th},boxblur=28:3[bg];"
+                f"[bb]scale={tw}:{th}:force_original_aspect_ratio=decrease[fg];"
+                f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v_blur];"
+                f"[v_face][v_split]overlay=0:0:enable='{s_expr}'[v_fs];"
+                f"[v_fs][v_blur]overlay=0:0:enable='{b_expr}',setsar=1[v_raw]"
+            )
+        elif blur_intervals:
+            b_expr = "+".join(f"between(t,{b0:.3f},{b1:.3f})" for b0, b1 in blur_intervals)
+            base = (
+                f"[0:v]split=3[vf][ba][bb];"
+                f"[vf]crop={cw}:{ch}:x='{x}':y={cy},scale={tw}:{th}:flags=lanczos,setsar=1[v_face];"
+                f"[ba]scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th},boxblur=28:3[bg];"
+                f"[bb]scale={tw}:{th}:force_original_aspect_ratio=decrease[fg];"
+                f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v_blur];"
+                f"[v_face][v_blur]overlay=0:0:enable='{b_expr}',setsar=1[v_raw]"
+            )
+        elif use_mid_split:
+            s_expr = "+".join(f"between(t,{s0:.3f},{s1:.3f})" for s0, s1 in split_intervals)
+            top_h = th // 2
+            bot_h = th - top_h
+            p_left, p_right, box_top, box_bot = split_paths if len(split_paths) == 4 else (*split_paths[:2], None, None)
+            split_crop_w = min(src_w, int(round(src_h * tw / top_h)) - (int(round(src_h * tw / top_h)) % 2))
+            default_ch = src_h - (src_h % 2)
+            cw_top, ch_top, y_top = box_top if box_top else (split_crop_w, default_ch, 0)
+            cw_bot, ch_bot, y_bot = box_bot if box_bot else (split_crop_w, default_ch, 0)
+            max_top_x = max(0, src_w - cw_top)
+            max_bot_x = max(0, src_w - cw_bot)
+            x_top = f"min(max({_lerp_expr(p_left)},0),{max_top_x})" if p_left else f"{max_top_x // 2}"
+            x_bot = f"min(max({_lerp_expr(p_right)},0),{max_bot_x})" if p_right else f"{max_bot_x // 2}"
+
+            base = (
+                f"[0:v]split=3[vf][sp1][sp2];"
+                f"[vf]crop={cw}:{ch}:x='{x}':y={cy},scale={tw}:{th}:flags=lanczos,setsar=1[v_face];"
+                f"[sp1]crop={cw_top}:{ch_top}:x='{x_top}':y={y_top},scale={tw}:{top_h}:flags=lanczos,setsar=1[top];"
+                f"[sp2]crop={cw_bot}:{ch_bot}:x='{x_bot}':y={y_bot},scale={tw}:{bot_h}:flags=lanczos,setsar=1[bot];"
+                f"[top][bot]vstack=inputs=2[stacked];"
+                f"[stacked]drawbox=y={top_h - 2}:color=black@0.75:width=iw:height=4:t=fill[v_split];"
+                f"[v_face][v_split]overlay=0:0:enable='{s_expr}',setsar=1[v_raw]"
+            )
+        else:
+            base = f"[0:v]crop={cw}:{ch}:x='{x}':y={cy},scale={tw}:{th}:flags=lanczos,setsar=1[v_raw]"
 
     # Synchronized dead-air silence removal (applied after face-tracking crop so crop uses original t)
     if keep_segs and len(keep_segs) >= 1:
         sel_expr = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in keep_segs)
-        trim_filter = f";[v_raw]select='{sel_expr}',setpts=N/FRAME_RATE/TB[v_trim]"
+        trim_filter = f";[v_raw]select='{sel_expr}',setpts='N/(if(isnan(FRAME_RATE),30,FRAME_RATE)*TB)'[v_trim]"
     else:
         trim_filter = ";[v_raw]null[v_trim]"
 
@@ -1110,8 +1456,8 @@ def build_graph(mode: str, aspect: str, src_w: int, src_h: int, tw: int, th: int
     if dynamic_zoom and aspect in ("9:16", "4:5", "1:1"):
         z_expr = "if(lt(t,2.2),1.07*(1-0.03*t/2.2),if(lt(mod(t,7.5),3.2),1.045,1.0))"
         zoom_filter = (
-            f";[v_trim]scale=eval=frame:w='{tw}*({z_expr})':"
-            f"h='{th}*({z_expr})',crop={tw}:{th}[v0]"
+            f";[v_trim]scale=eval=frame:w='trunc({tw}*({z_expr})/2)*2':"
+            f"h='trunc({th}*({z_expr})/2)*2',crop={tw}:{th}[v0]"
         )
     else:
         zoom_filter = ";[v_trim]null[v0]"
@@ -1119,29 +1465,72 @@ def build_graph(mode: str, aspect: str, src_w: int, src_h: int, tw: int, th: int
     return base + trim_filter + zoom_filter + ";" + _subs_filter(has_subs, "v0", "v")
 
 
-def _consult_vision_model(src: str, start: float, end: float, title: str, cfg: dict, model: str) -> dict | None:
-    """Invokes the multimodal vision model on keyframe(s) from this clip to guide camera framing and layout."""
+def _consult_vision_model(
+    src: str,
+    start: float,
+    end: float,
+    title: str,
+    words: list[dict],
+    cfg: dict,
+    model: str,
+) -> dict | None:
+    """Master Vision Director: scans the ENTIRE clip from start to end to detect every visual scene
+    (camera cuts, image/slide popups, B-roll insertions, screen shares), extracts a keyframe for every scene,
+    and obtains a full scene-by-scene directing plan to command OpenCV YuNet and FFmpeg.
+    """
     try:
-        import base64
-        import tempfile
         from . import llm
 
-        # Extract 2 keyframes: 1 early in the shot (0.6s after start), 1 at the midpoint
-        t1 = start + 0.6
-        t2 = (start + end) / 2
-        images_b64: list[str] = []
-        with tempfile.TemporaryDirectory(prefix="clipforge-render-vis-") as td:
-            for i, at_sec in enumerate([t1, t2]):
-                f_path = Path(td) / f"vframe_{i}.jpg"
-                if media.make_thumb(src, f_path, at=at_sec, width=640):
-                    images_b64.append(base64.b64encode(f_path.read_bytes()).decode("utf-8"))
+        scene_segs = _detect_scene_segments(src, start, end, samples_per_sec=2.0, max_scenes=8)
+        images_b64, scene_descs = _extract_scene_annotated_frames(src, start, scene_segs)
 
         if not images_b64:
             return None
 
-        vis = llm.analyze_visual_framing(cfg, model, images_b64, title=title)
-        log.info("Vision Director guidance for render: layout=%s, graphic=%s, reason=%s",
-                 vis.get("layout"), vis.get("has_onscreen_graphic"), vis.get("visual_reason"))
+        clip_words = [w["w"] for w in words if w.get("e", 0) > start and w.get("s", 0) < end]
+        snippet = " ".join(clip_words)[:750]
+
+        vis = llm.analyze_visual_framing(
+            cfg,
+            model,
+            images_b64,
+            title=title,
+            transcript_snippet=snippet,
+            scene_descriptions=scene_descs,
+        )
+
+        # Map the model's scene directives onto exact (start, end) timestamps
+        raw_scenes = vis.get("scenes") or []
+        scene_by_idx = {int(s.get("scene_index", i + 1)): s for i, s in enumerate(raw_scenes) if isinstance(s, dict)}
+        default_layout = vis.get("layout") or "face"
+        default_side = vis.get("primary_speaker_side") or "auto"
+        default_graphic = bool(vis.get("has_onscreen_graphic", False))
+
+        timeline: list[dict] = []
+        for idx, (s0, s1) in enumerate(scene_segs, 1):
+            sc = scene_by_idx.get(idx) or {}
+            sc_layout = sc.get("layout") or default_layout
+            sc_graphic = bool(sc.get("has_graphic", False)) or (sc_layout == "blur")
+            if sc_graphic:
+                sc_layout = "blur"
+            timeline.append({
+                "scene_index": idx,
+                "start": s0,
+                "end": s1,
+                "layout": sc_layout,
+                "focus_side": sc.get("focus_side") or default_side,
+                "has_graphic": sc_graphic,
+            })
+
+        vis["scene_timeline"] = timeline
+        log.info(
+            "Master Vision Director plan (%d scenes): overall=%s, tracking=%s, scenes=%s, reason=%s",
+            len(timeline),
+            vis.get("layout"),
+            vis.get("tracking_style"),
+            [(t["scene_index"], t["layout"], f"{t['start']}..{t['end']}s") for t in timeline],
+            vis.get("visual_reason"),
+        )
         return vis
     except Exception as e:
         log.warning("Vision model consultation failed during render: %s", e)
@@ -1154,7 +1543,7 @@ def _slug(text: str, n: int = 48) -> str:
 
 
 def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, progress_cb) -> dict:
-    """Render one clip. Returns {path, thumb, width, height, size}."""
+    """Render one clip. Returns {path, thumb, width, height, size, mode, visual_reason}."""
     src = video["path"]
     info = media.probe(src)
     sw, sh = info["width"], info["height"]
@@ -1167,7 +1556,8 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
         raise RuntimeError("The clip is shorter than one second.")
 
     aspect = opts.get("aspect") or cfg["aspect"]
-    mode = opts.get("reframe") or cfg["reframe"]
+    requested_mode = opts.get("reframe") or cfg["reframe"]
+    mode = requested_mode
     captions = bool(opts.get("captions", cfg["captions"]))
     show_headline = bool(opts.get("headline", cfg.get("headline_banner", True)))
     norm_audio = bool(opts.get("normalize_audio", cfg.get("normalize_audio", True)))
@@ -1184,6 +1574,9 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
     split_paths = None
     gaming_boxes = None
     crop_box = None
+    blur_intervals: list[tuple[float, float]] = []
+    scene_timeline: list[dict] = []
+    visual_reason = ""
 
     if aspect != "16:9" and crop_w <= sw:
         has_yunet = (Path(__file__).parent / "models" / "face_detection_yunet_2023mar.onnx").is_file()
@@ -1192,43 +1585,73 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
         vision_hints = None
         vision_model = (cfg.get("vision_model") or "").strip()
         if vision_model:
-            progress_cb(0.03, f"Vision Director inspecting layout ({vision_model})")
-            vision_hints = _consult_vision_model(src, start, end, clip.get("title") or "", cfg, vision_model)
+            progress_cb(0.03, f"Master Vision Director scanning full clip ({vision_model})")
+            vision_hints = _consult_vision_model(src, start, end, clip.get("title") or "", words, cfg, vision_model)
             if vision_hints:
+                visual_reason = (vision_hints.get("visual_reason") or "").strip()
+                scene_timeline = vision_hints.get("scene_timeline") or []
                 v_layout = vision_hints.get("layout")
                 is_gaming = vision_hints.get("is_gaming")
                 has_graphic = vision_hints.get("has_onscreen_graphic")
-                if is_gaming or v_layout == "gaming":
-                    mode = "gaming"
-                elif has_graphic or v_layout == "blur":
-                    mode = "blur"
-                elif v_layout == "split" and aspect == "9:16" and mode not in ("blur", "center"):
-                    mode = "split"
-                engine_label += " + Vision"
+
+                # Calculate duration-weighted dominant layout across all scenes
+                dur_by_layout: dict[str, float] = {}
+                for sc in scene_timeline:
+                    sc_l = sc.get("layout") or v_layout or "face"
+                    dur_by_layout[sc_l] = dur_by_layout.get(sc_l, 0.0) + max(0.0, float(sc["end"]) - float(sc["start"]))
+
+                all_blur = scene_timeline and all(sc.get("layout") == "blur" or sc.get("has_graphic") for sc in scene_timeline)
+                has_face_scenes = any(sc.get("layout") in ("face", "split") for sc in scene_timeline)
+
+                if requested_mode not in ("center", "blur"):
+                    if (is_gaming or v_layout == "gaming" or dur_by_layout.get("gaming", 0.0) > dur * 0.4) and aspect == "9:16":
+                        mode = "gaming"
+                    elif all_blur or (has_graphic and not has_face_scenes):
+                        mode = "blur"
+                    elif dur_by_layout.get("split", 0.0) >= dur * 0.55 and aspect == "9:16":
+                        mode = "split"
+                    elif has_face_scenes or v_layout == "face":
+                        mode = "face"
+                engine_label += " + Master Vision"
 
         if mode == "gaming" and aspect == "9:16":
             webcam_hint = vision_hints.get("webcam_quadrant") if vision_hints else None
             progress_cb(0.05, f"Detecting Gaming Cam-Stack ({engine_label})")
             gaming_boxes = detect_gaming_layout(src, start, end, sw, sh, tw, th, webcam_hint=webcam_hint)
             if not gaming_boxes:
-                # If no facecam is detected in gameplay, fit full game with blurred background
                 mode = "blur"
+            else:
+                for sc in scene_timeline:
+                    if sc.get("layout") == "blur" or sc.get("has_graphic"):
+                        blur_intervals.append((float(sc["start"]), float(sc["end"])))
+                if any(sc.get("layout") == "face" for sc in scene_timeline):
+                    res = face_path(src, start, end, sw, sh, crop_w, vision_hints=vision_hints)
+                    if res is not None:
+                        path, crop_box, _ = res
 
-        if mode == "split" and aspect == "9:16":
+        need_split_tracks = (mode == "split" and aspect == "9:16") or (
+            mode == "face" and aspect == "9:16" and any(sc.get("layout") == "split" for sc in scene_timeline)
+        )
+        if need_split_tracks:
             top_h = th // 2
             split_crop_w = int(round(sh * tw / top_h))
             split_crop_w = min(sw, split_crop_w - (split_crop_w % 2))
-            progress_cb(0.05, f"Detecting split speakers ({engine_label})")
+            progress_cb(0.05, f"Tracking dual speakers ({engine_label})")
             split_paths = face_paths_split(src, start, end, sw, sh, split_crop_w)
-            if not split_paths or (not split_paths[0] and not split_paths[1]):
+            if mode == "split" and (not split_paths or (not split_paths[0] and not split_paths[1])):
                 mode = "face"  # fallback to single face if no multi-face
+
         if mode == "face":
-            progress_cb(0.05, f"Tracking faces ({engine_label})")
+            progress_cb(0.06, f"Tracking faces across scenes ({engine_label})")
             res = face_path(src, start, end, sw, sh, crop_w, vision_hints=vision_hints)
             if res is None:
                 mode = "blur"  # fallback to blur so graphics/slides/speakers are never sliced in half
             else:
-                path, crop_box = res
+                path, crop_box, blur_intervals = res
+        elif mode == "split":
+            for sc in scene_timeline:
+                if sc.get("layout") == "blur" or sc.get("has_graphic"):
+                    blur_intervals.append((float(sc["start"]), float(sc["end"])))
 
     headline_text = (clip.get("title") or "").strip() if (show_headline and aspect in ("9:16", "4:5")) else None
     has_caption_words = captions and any(w["e"] > start and w["s"] < end for w in words)
@@ -1271,7 +1694,8 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
         graph = build_graph(mode, aspect, sw, sh, tw, th, path, crop_w, has_subs,
                             split_paths=split_paths, gaming_boxes=gaming_boxes,
                             dynamic_zoom=dynamic_zoom, keep_segs=keep_segs,
-                            crop_box=crop_box)
+                            crop_box=crop_box, blur_intervals=blur_intervals,
+                            scene_timeline=scene_timeline)
 
         # Audio handling: synchronized silence trim + denoising + broadcast standard loudnorm
         audio_args = []
@@ -1283,7 +1707,7 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
             if clean_audio:
                 af_chain.extend(["highpass=f=75", "lowpass=f=12000", "afftdn=nf=-25"])
             if norm_audio:
-                af_chain.append("loudnorm=I=-14:LRA=11:TP=-1.5")
+                af_chain.extend(["loudnorm=I=-14:LRA=11:TP=-1.5", "aresample=44100"])
             # Algorithm Hacking: 80ms loop crossfade at tail so TikTok/Shorts loop is 100% pop-free
             if effective_dur > 2.0:
                 fade_start = max(0.0, effective_dur - 0.08)
@@ -1326,4 +1750,5 @@ def render(clip: dict, video: dict, words: list[dict], opts: dict, cfg: dict, pr
         "width": tw, "height": th,
         "size": out_path.stat().st_size,
         "mode": mode,
+        "visual_reason": visual_reason,
     }

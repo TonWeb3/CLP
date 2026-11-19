@@ -103,50 +103,52 @@ def init() -> None:
             if col not in acc_cols:
                 _conn.execute(f"ALTER TABLE social_accounts ADD COLUMN {col} {ctype};")
 
-        # Seed or migrate default accounts if none exist for a platform
+        # Migrate legacy accounts only if keys or token files already exist
         yt_count = _conn.execute("SELECT COUNT(*) AS n FROM social_accounts WHERE platform='youtube'").fetchone()["n"]
         if yt_count == 0:
             cfg = config.get()
-            now = time.time()
             old_yt_token = config.DATA_DIR / "youtube_token.json"
-            cur = _conn.execute(
-                "INSERT INTO social_accounts(platform, name, client_id, client_secret, privacy, add_shorts_tag, created, updated) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "youtube",
-                    "YouTube #1",
-                    cfg.get("yt_client_id", ""),
-                    cfg.get("yt_client_secret", ""),
-                    cfg.get("yt_privacy", "private"),
-                    1 if cfg.get("yt_add_shorts_tag", True) else 0,
-                    now,
-                    now,
-                ),
-            )
-            if old_yt_token.exists():
-                shutil.copy2(old_yt_token, config.DATA_DIR / "tokens" / f"youtube_{cur.lastrowid}.json")
+            if cfg.get("yt_client_id") or cfg.get("yt_client_secret") or old_yt_token.exists():
+                now = time.time()
+                cur = _conn.execute(
+                    "INSERT INTO social_accounts(platform, name, client_id, client_secret, privacy, add_shorts_tag, created, updated) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "youtube",
+                        "YouTube #1",
+                        cfg.get("yt_client_id", ""),
+                        cfg.get("yt_client_secret", ""),
+                        cfg.get("yt_privacy", "private"),
+                        1 if cfg.get("yt_add_shorts_tag", True) else 0,
+                        now,
+                        now,
+                    ),
+                )
+                if old_yt_token.exists():
+                    shutil.copy2(old_yt_token, config.DATA_DIR / "tokens" / f"youtube_{cur.lastrowid}.json")
 
         tt_count = _conn.execute("SELECT COUNT(*) AS n FROM social_accounts WHERE platform='tiktok'").fetchone()["n"]
         if tt_count == 0:
             cfg = config.get()
-            now = time.time()
             old_tt_token = config.DATA_DIR / "tiktok_token.json"
-            cur = _conn.execute(
-                "INSERT INTO social_accounts(platform, name, client_id, client_secret, privacy, add_shorts_tag, created, updated) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "tiktok",
-                    "TikTok #1",
-                    cfg.get("tiktok_client_key", ""),
-                    cfg.get("tiktok_client_secret", ""),
-                    cfg.get("tiktok_privacy", "INBOX"),
-                    0,
-                    now,
-                    now,
-                ),
-            )
-            if old_tt_token.exists():
-                shutil.copy2(old_tt_token, config.DATA_DIR / "tokens" / f"tiktok_{cur.lastrowid}.json")
+            if cfg.get("tiktok_client_key") or cfg.get("tiktok_client_secret") or old_tt_token.exists():
+                now = time.time()
+                cur = _conn.execute(
+                    "INSERT INTO social_accounts(platform, name, client_id, client_secret, privacy, add_shorts_tag, created, updated) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "tiktok",
+                        "TikTok #1",
+                        cfg.get("tiktok_client_key", ""),
+                        cfg.get("tiktok_client_secret", ""),
+                        cfg.get("tiktok_privacy", "INBOX"),
+                        0,
+                        now,
+                        now,
+                    ),
+                )
+                if old_tt_token.exists():
+                    shutil.copy2(old_tt_token, config.DATA_DIR / "tokens" / f"tiktok_{cur.lastrowid}.json")
 
         _conn.commit()
 
@@ -164,9 +166,13 @@ def one(sql: str, args: tuple = ()) -> dict | None:
 
 def ex(sql: str, args: tuple = ()) -> int:
     with _lock:
-        cur = _conn.execute(sql, args)
-        _conn.commit()
-        return cur.lastrowid
+        try:
+            cur = _conn.execute(sql, args)
+            _conn.commit()
+            return cur.lastrowid
+        except Exception:
+            _conn.rollback()
+            raise
 
 
 def insert(table: str, **fields) -> int:

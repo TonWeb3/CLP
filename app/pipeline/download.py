@@ -18,7 +18,7 @@ def _friendly(msg: str) -> str:
                 "exported from a logged-in browser into the Cookies box, and retry.")
     if "private video" in low:
         return "This video is private."
-    if "video unavailable" in low or "unavailable" in low and "video" in low:
+    if "video unavailable" in low or ("unavailable" in low and "video" in low):
         return "This video is unavailable."
     if "ffmpeg" in low and "not found" in low:
         return "ffmpeg is not installed on this server."
@@ -50,9 +50,15 @@ def download(url: str, dest_dir: Path, cfg: dict, progress_cb, cancel_check) -> 
     if media.have_ffmpeg():
         opts["ffmpeg_location"] = media.FFMPEG
     cookies = (cfg.get("cookies") or "").strip()
+    cf: Path | None = None
     if cookies:
         cf = dest_dir / "cookies.txt"
         cf.write_text(cookies + "\n", "utf-8")
+        try:
+            import os
+            os.chmod(cf, 0o600)
+        except OSError:
+            pass
         opts["cookiefile"] = str(cf)
 
     def hook(d):
@@ -75,6 +81,9 @@ def download(url: str, dest_dir: Path, cfg: dict, progress_cb, cancel_check) -> 
             info = ydl.extract_info(url, download=True)
     except Exception as e:  # noqa: BLE001
         raise DownloadError(_friendly(str(e))) from e
+    finally:
+        if cf is not None:
+            cf.unlink(missing_ok=True)
 
     path = None
     for rd in (info.get("requested_downloads") or []):

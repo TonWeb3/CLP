@@ -80,7 +80,10 @@ def chat_json(cfg: dict, model: str, system: str, user: str, schema: dict, image
             raise LLMError(f"Model '{model}' is not installed in Ollama. Pull it on the Models page.")
         if r.status_code != 200:
             raise LLMError(f"Ollama error {r.status_code}: {r.text[:300]}")
-        content = (r.json().get("message") or {}).get("content", "")
+        try:
+            content = (r.json().get("message") or {}).get("content", "")
+        except Exception as e:
+            raise LLMError("Ollama returned an invalid response.") from e
         return parse_json(content)
 
     # OpenAI-compatible (Groq, OpenRouter, Gemini's compatibility endpoint, LM Studio, vLLM ...)
@@ -112,7 +115,10 @@ def chat_json(cfg: dict, model: str, system: str, user: str, schema: dict, image
         raise LLMError("The API key was rejected. Check it in Settings.")
     if r.status_code != 200:
         raise LLMError(f"LLM API error {r.status_code}: {r.text[:300]}")
-    content = r.json()["choices"][0]["message"]["content"]
+    try:
+        content = r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        raise LLMError("The LLM API returned an invalid response structure.") from e
     return parse_json(content)
 
 
@@ -225,34 +231,70 @@ VISION_DIRECTOR_SCHEMA = {
             "type": "string",
             "enum": ["left", "right", "center", "both"],
         },
+        "tracking_style": {
+            "type": "string",
+            "enum": ["active_speaker", "smooth_follow", "lock_primary", "static_center"],
+        },
+        "ignore_background_faces": {
+            "type": "boolean",
+        },
+        "scenes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "scene_index": {"type": "integer"},
+                    "layout": {
+                        "type": "string",
+                        "enum": ["face", "split", "gaming", "blur", "center"],
+                    },
+                    "focus_side": {
+                        "type": "string",
+                        "enum": ["left", "right", "center", "both", "auto"],
+                    },
+                    "has_graphic": {"type": "boolean"},
+                },
+                "required": ["scene_index", "layout"],
+            },
+        },
     },
-    "required": ["layout", "visual_reason", "has_onscreen_graphic"],
+    "required": ["layout", "visual_reason", "has_onscreen_graphic", "scenes"],
 }
 
 
-def analyze_visual_framing(cfg: dict, model: str, images_b64: list[str], title: str = "", transcript_snippet: str = "") -> dict:
-    """Vision Director: analyzes video keyframe(s) to assist the OpenCV/YuNet render engine with framing layout and speaker positioning."""
+def analyze_visual_framing(
+    cfg: dict,
+    model: str,
+    images_b64: list[str],
+    title: str = "",
+    transcript_snippet: str = "",
+    scene_descriptions: list[str] | None = None,
+) -> dict:
+    """Master Vision Director: scans scenes across the clip and issues scene-by-scene camera & face-tracking directives to OpenCV YuNet and FFmpeg."""
     system = (
-        "You are an elite AI cinematographer and universal video director for short-form video (TikTok, YouTube Shorts, Reels).\n"
-        "Your mission is to inspect the video frame(s) to assist the computer-vision face tracker (OpenCV YuNet) with camera framing across ANY genre:\n\n"
-        "Framing modes:\n"
-        "1. 'gaming': Use when the video is a VIDEO GAME stream or gameplay footage. If a streamer facecam/webcam is in a corner, this directs the renderer to produce the viral Streamer Cam-Stack (streamer reaction box on top + gameplay action on bottom).\n"
-        "2. 'split': Use when there are TWO distinct people in dialogue (e.g. podcast host on left, guest on right). This instructs the renderer to produce a stacked top/bottom dual-camera split-screen.\n"
-        "3. 'blur': Use when the frame displays an ON-SCREEN GRAPHIC, presentation slide, screen capture, code editor, meme, document, or wide b-roll spanning the 16:9 frame. This fits the full frame with a blurred background so text/graphics are never cut off.\n"
-        "4. 'face': Use when there is a SINGLE primary speaker talking to camera or standard multi-camera podcast cutting.\n"
-        "5. 'center': Use for general wide shots or centered content.\n\n"
-        "Identify:\n"
-        "- layout: 'gaming', 'split', 'blur', 'face', or 'center'\n"
-        "- is_gaming: true if gameplay HUD / video game is present\n"
-        "- webcam_quadrant: where the streamer webcam is located, if any ('bottom_right', 'bottom_left', 'top_right', 'top_left', 'none')\n"
-        "- has_onscreen_graphic: true if there is a graphic/slide/tweet/code that must be kept visible\n"
-        "- primary_speaker_side: 'left', 'right', 'center', or 'both'\n"
-        "- visual_reason: concise reason for the framing decision\n"
+        "You are the Master AI Video Director and Cinematographer for short-form vertical video (TikTok, YouTube Shorts, Reels).\n"
+        "You are given chronological keyframe images (or storyboard contact sheets) representing numbered scenes across a clip.\n"
+        "You are the MASTER controller: your directives command the OpenCV YuNet neural face tracker and the FFmpeg multi-layout compositor.\n\n"
+        "Available framing layouts (can be set overall AND switched per scene in `scenes`):\n"
+        "1. 'face': Follow the active speaker talking to the camera (ideal for podcasts, interviews, sermons, comedy, keynotes, vlogs, education). If there are background faces, crowd members, posters, or reaction images on a screen behind the speaker, set `ignore_background_faces: true` so OpenCV never jumps to a bystander or TV screen.\n"
+        "2. 'blur': MUST BE USED for any scene where an ON-SCREEN GRAPHIC, image, tweet, chart, presentation slide, screen share, code editor, scoreboard, or wide diagram appears! This switches the video to a full-frame letterboxed view over a blurred background so the graphic/image is 100% readable and never cropped in half.\n"
+        "3. 'split': Use when TWO distinct people are visible in the same wide shot having a back-and-forth conversation (e.g. podcast host on left, guest on right). Stacks both speakers top & bottom.\n"
+        "4. 'gaming': Use when VIDEO GAME gameplay / HUD OR a Reaction/Commentary video is on screen with a creator facecam/webcam overlay in a corner. Stacks the creator facecam on top (36%) and gameplay/reacted content on bottom (64%).\n"
+        "5. 'center': Use for full-height cinematic B-roll, sports/fitness action, cooking/product close-ups, or wide group shots where no single face should be cropped in and no text graphic is being cut off.\n\n"
+        "Your Master Director Responsibilities:\n"
+        "- Inspect EVERY numbered scene image in order.\n"
+        "- If a speaker is talking in Scene 1 ('face'), then shows an image/chart/screen-share in Scene 2 ('blur'), and returns to talking in Scene 3 ('face'), output those exact layouts in `scenes` so the renderer dynamically switches layouts mid-clip without looking like a bad edit!\n"
+        "- For each scene in `scenes`, specify `scene_index` (1-based), `layout` ('face', 'blur', 'split', 'gaming', 'center'), `focus_side` ('left', 'right', 'center', 'both', 'auto'), and `has_graphic` (true if an image/slide/text graphic is shown in that scene).\n"
+        "- Set `tracking_style`: 'active_speaker' (cuts to whoever's mouth is moving), 'smooth_follow' (glides with a single moving speaker), 'lock_primary' (locks onto the main speaker and ignores bystanders), or 'static_center'.\n"
+        "- Set `webcam_quadrant` if a streamer facecam is in a corner ('bottom_right', 'bottom_left', 'top_right', 'top_left', 'none').\n"
+        "- Set `visual_reason`: concise summary of your directing plan across the clip.\n"
         "Return valid JSON matching the schema."
     )
+    scene_list_txt = "\n".join(scene_descriptions) if scene_descriptions else f"{len(images_b64)} chronological keyframes across the clip."
     user = (
-        f"Clip: {title}\n"
-        f"Context: {transcript_snippet}\n"
-        "Analyze the visual composition of these frame(s). What is the optimal camera framing directive for the render engine?"
+        f"Clip Title: {title}\n"
+        f"Spoken Transcript: {transcript_snippet}\n"
+        f"Chronological Scenes to Direct:\n{scene_list_txt}\n\n"
+        "Inspect each scene and return the Master Vision Director JSON plan."
     )
     return chat_json(cfg, model, system, user, VISION_DIRECTOR_SCHEMA, images=images_b64)

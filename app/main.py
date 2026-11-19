@@ -374,7 +374,7 @@ def cancel_video(vid: int):
 @app.delete("/api/videos/{vid}")
 def delete_video(vid: int):
     v = _get_video(vid)
-    if v["status"] in ("downloading", "audio", "transcribing", "analyzing"):
+    if v["status"] in ("queued", "downloading", "audio", "transcribing", "analyzing"):
         raise HTTPException(400, "Cancel the job before deleting it.")
     db.ex("DELETE FROM clips WHERE video_id=? AND status!='ready'", (vid,))
     jobs.delete_video_files(vid)
@@ -423,19 +423,30 @@ def render_clips(vid: int, body: RenderBody):
     opts = {k: val for k, val in body.model_dump().items() if k != "clip_ids" and val is not None}
     if opts.get("aspect") not in (None, "9:16", "1:1", "4:5", "16:9"):
         raise HTTPException(400, "Unknown aspect ratio")
-    if opts.get("reframe") not in (None, "face", "split", "center", "blur"):
+    if opts.get("reframe") not in (None, "face", "split", "gaming", "center", "blur"):
         raise HTTPException(400, "Unknown reframe mode")
     if opts.get("caption_preset") not in (None, "classic", "hormozi", "mrbeast", "minimalist"):
         raise HTTPException(400, "Unknown caption preset")
     n = 0
+    already_rendering = 0
+    now = time.time()
     for cid in body.clip_ids:
         c = db.one("SELECT * FROM clips WHERE id=? AND video_id=?", (cid, vid))
-        if not c or c["status"] in ("queued", "rendering"):
+        if not c:
             continue
-        db.update("clips", cid, status="queued", progress=0.0, error=None, render_opts=json.dumps(opts))
+        if c["status"] in ("queued", "rendering"):
+            if now - float(c.get("updated") or c.get("created") or 0) < 180:
+                already_rendering += 1
+                continue
+        try:
+            existing_opts = json.loads(c.get("render_opts") or "{}")
+        except Exception:
+            existing_opts = {}
+        merged_opts = {**existing_opts, **opts}
+        db.update("clips", cid, status="queued", progress=0.0, error=None, render_opts=json.dumps(merged_opts))
         jobs.enqueue("render", cid)
         n += 1
-    return {"queued": n}
+    return {"queued": n, "already_rendering": already_rendering, "total": len(body.clip_ids)}
 
 
 # --------------------------------------------------------------------------
@@ -513,7 +524,7 @@ def clip_thumb(cid: int):
 @app.delete("/api/clips/{cid}")
 def delete_clip(cid: int):
     c = _get_clip(cid)
-    if c["status"] in ("queued", "rendering") or c["yt_status"] == "uploading":
+    if c["status"] in ("queued", "rendering") or c["yt_status"] == "uploading" or c.get("tiktok_status") == "uploading":
         raise HTTPException(400, "This clip is busy. Wait for it to finish.")
     for p in (c.get("path"), c.get("thumb_path")):
         if p:
@@ -521,7 +532,8 @@ def delete_clip(cid: int):
     if c["status"] == "ready" and db.one("SELECT 1 AS x FROM videos WHERE id=?", (c["video_id"],)):
         # keep the suggestion so it can be rendered again
         db.update("clips", cid, status="candidate", path=None, thumb_path=None, progress=0.0, size=None,
-                  yt_status=None, yt_id=None, yt_error=None)
+                  yt_status=None, yt_id=None, yt_error=None, tiktok_status=None, tiktok_id=None, tiktok_error=None,
+                  uploads_json="{}")
     else:
         db.ex("DELETE FROM clips WHERE id=?", (cid,))
     return {"ok": True}

@@ -183,9 +183,13 @@ function HomePage() {
       else if (!hl.whisper_ready) issues.push(`The speech model "${hl.whisper_model}" is not downloaded yet.`);
       if (!hl.llm) issues.push(hl.llm_message);
       else if (hl.llm_provider === "ollama") {
+        const hasModel = (name) => {
+          const base = String(name || "").replace(/:latest$/, "");
+          return hl.llm_models.some((x) => x === name || x.replace(/:latest$/, "") === base);
+        };
         if (!hl.filter_model && !hl.ranker_model) issues.push("No language model is selected yet.");
-        else for (const m of [hl.filter_model, hl.ranker_model]) {
-          if (m && !hl.llm_models.includes(m) && !hl.llm_models.includes(m + ":latest")) issues.push(`The model "${m}" is not installed in Ollama.`);
+        else for (const m of [hl.filter_model, hl.ranker_model, hl.vision_model]) {
+          if (m && !hasModel(m)) issues.push(`The model "${m}" is not installed in Ollama.`);
         }
       } else if (!hl.filter_model && !hl.ranker_model) issues.push("No language model name is set in Settings.");
       const uniq = [...new Set(issues)];
@@ -322,6 +326,8 @@ function VideoPage(id) {
       const statusBar = bar(0);
       const err = h("div", { class: "small", style: { color: "var(--err)" } });
 
+      const reasonEl = h("div", { class: "small muted" });
+
       function update(nc) {
         Object.assign(c, nc);
         const st = c.status;
@@ -333,6 +339,28 @@ function VideoPage(id) {
         statusBar.style.display = st === "rendering" || st === "queued" ? "" : "none";
         setBar(statusBar, c.progress * 100);
         err.textContent = st === "failed" ? (c.error || "") : "";
+
+        reasonEl.replaceChildren();
+        const applied = c.render_opts && c.render_opts.applied_reframe;
+        const visReason = (c.render_opts && c.render_opts.visual_reason) || "";
+        if (c.reason && c.reason.includes("Seamless Loop")) {
+          reasonEl.append(h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🔄 Seamless Loop", "ok")));
+        }
+        if (applied === "split") {
+          reasonEl.append(h("span", { style: { display: "inline-block", marginRight: "6px" }, title: visReason }, chip("🎬 Framed: Dual Split", "warn")));
+        } else if (applied === "gaming") {
+          reasonEl.append(h("span", { style: { display: "inline-block", marginRight: "6px" }, title: visReason }, chip("🎮 Framed: Gaming Stack", "info")));
+        } else if (applied === "blur") {
+          reasonEl.append(h("span", { style: { display: "inline-block", marginRight: "6px" }, title: visReason }, chip("🎬 Framed: Graphic Blur", "info")));
+        } else if (applied === "face") {
+          reasonEl.append(h("span", { style: { display: "inline-block", marginRight: "6px" }, title: visReason }, chip("🎬 Framed: Speaker Track", "ok")));
+        }
+        if (c.reason) {
+          reasonEl.append(c.reason.replace(/\[🔄 Seamless Loop:[^\]]+\]\s*/, "").replace(/\[🎬 Vision:[^\]]+\]\s*/, ""));
+        }
+        if (visReason) {
+          reasonEl.append(h("div", { class: "small muted", style: { marginTop: "3px" } }, "🎬 Vision Director: " + visReason));
+        }
       }
 
       const el = h("div", { class: "cand" + (c.selected ? " selected" : "") },
@@ -341,14 +369,7 @@ function VideoPage(id) {
         h("div", { class: "stack", style: { gap: "8px", minWidth: 0 } },
           title,
           c.hook ? h("div", { class: "hook" }, "“" + c.hook + "”") : null,
-          c.reason ? h("div", { class: "small muted" },
-            c.reason.includes("Seamless Loop") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🔄 Seamless Loop", "ok")) : null,
-            (c.render_opts && c.render_opts.reframe === "split") || c.reason.includes("[🎬 Vision: SPLIT") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🎬 Vision: Dual Split", "warn")) : null,
-            (c.render_opts && c.render_opts.reframe === "gaming") || c.reason.includes("[🎬 Vision: GAMING") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🎮 Vision: Gaming Stack", "info")) : null,
-            (c.render_opts && c.render_opts.reframe === "blur") || c.reason.includes("[🎬 Vision: BLUR") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🎬 Vision: Graphic Blur", "err")) : null,
-            (c.render_opts && c.render_opts.reframe === "face") || c.reason.includes("[🎬 Vision: FACE") ? h("span", { style: { display: "inline-block", marginRight: "6px" } }, chip("🎬 Vision: Follow Speaker", "ok")) : null,
-            c.reason.replace(/\[🔄 Seamless Loop:[^\]]+\]\s*/, "").replace(/\[🎬 Vision:[^\]]+\]\s*/, "")
-          ) : null,
+          reasonEl,
           h("div", { class: "times" }, h("span", { class: "small muted" }, "Start"), sInp, useNow(sInp),
             h("span", { class: "small muted" }, "End"), eInp, useNow(eInp), durEl,
             h("button", { class: "btn sm", onclick: () => preview(c) }, "Preview")),
@@ -393,7 +414,12 @@ function VideoPage(id) {
           remove_silence: silence.checked,
         }
       });
-      toast(r.queued ? `${r.queued} clip${r.queued > 1 ? "s" : ""} queued for rendering.` : "Those clips are already rendering.");
+      if (r.queued) {
+        const extra = r.already_rendering ? ` (${r.already_rendering} already in progress)` : "";
+        toast(`${r.queued} clip${r.queued > 1 ? "s" : ""} queued for rendering${extra}.`);
+      } else {
+        toast("Selected clips are already rendering.");
+      }
       load();
     }) }, "Render");
     updateRenderBar = () => { const n = sels().length; renderBtn.textContent = n ? `Render ${n} clip${n > 1 ? "s" : ""}` : "Select clips to render"; renderBtn.disabled = !n; };
@@ -668,13 +694,17 @@ function LibraryPage() {
       if (ttUploads.length) {
         for (const u of ttUploads) {
           const nm = u.name || "TikTok";
+          const isInbox = !u.privacy || u.privacy === "INBOX";
           if (u.status === "uploading") ttBox.append(h("div", {}, chip(`${nm}: ${Math.round((u.progress || 0) * 100)}%`, "info")));
-          else if (u.status === "done") ttBox.append(h("div", {}, chip(nm, "ok"), " Sent to Inbox 📱", h("div", { class: "hint", style: { fontSize: "11px", marginTop: "2px" } }, "Open TikTok app > Inbox > System notifications to post.")));
+          else if (u.status === "done") ttBox.append(h("div", {},
+            chip(nm, "ok"),
+            isInbox ? " Sent to Inbox 📱" : " Published Direct ✅",
+            isInbox ? h("div", { class: "hint", style: { fontSize: "11px", marginTop: "2px" } }, "Open TikTok app > Inbox > System notifications to post.") : null));
           else if (u.status === "failed") ttBox.append(h("div", {}, chip(`${nm} failed`, "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, u.error || "")));
         }
       } else {
         if (c.tiktok_status === "uploading") ttBox.append(chip("TikTok: " + Math.round(c.tiktok_progress * 100) + "%", "info"));
-        else if (c.tiktok_status === "done") ttBox.append(chip("TikTok", "ok"), " Sent to Inbox 📱", h("div", { class: "hint", style: { fontSize: "11px", marginTop: "2px" } }, "Open TikTok app > Inbox > System notifications to post."));
+        else if (c.tiktok_status === "done") ttBox.append(chip("TikTok", "ok"), " Uploaded 📱");
         else if (c.tiktok_status === "failed") ttBox.append(chip("TikTok failed", "err"), h("div", { style: { color: "var(--err)", marginTop: "2px" } }, c.tiktok_error || ""));
       }
       ttBar.style.display = c.tiktok_status === "uploading" ? "" : "none";
@@ -689,11 +719,20 @@ function LibraryPage() {
       await api(`/clips/${c.id}`, { method: "DELETE" }); load();
     }) }, "Delete");
 
+    const appliedMode = c.render_opts && c.render_opts.applied_reframe;
+    const visReason = (c.render_opts && c.render_opts.visual_reason) || "";
+    const modeBadge = appliedMode === "gaming" ? chip("🎮 Gaming Stack", "info")
+      : appliedMode === "split" ? chip("🎬 Dual Split", "warn")
+      : appliedMode === "blur" ? chip("🎬 Graphic Blur", "info")
+      : appliedMode === "face" ? chip("🎬 Speaker Track", "ok")
+      : null;
+
     const el = h("div", { class: "clip" },
       h("video", { class: wide ? "wide" : "", controls: true, preload: "metadata", poster: c.has_thumb ? `/api/clips/${c.id}/thumb` : null, src: `/api/clips/${c.id}/file` }),
       h("div", { class: "body" },
         h("div", { class: "ttl" }, c.title),
         h("div", { class: "small muted" }, `${Math.round(c.end - c.start)}s · ${c.width}×${c.height} · ${fmtBytes(c.size)}`),
+        modeBadge ? h("div", { title: visReason }, modeBadge) : null,
         h("div", { class: "small muted", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, title: c.video_title }, "From: " + (c.video_title || "")),
         ytBox, ytBar, ttBox, ttBar,
         h("div", { class: "actions" },
@@ -842,7 +881,7 @@ function PublisherPage() {
     const pad2 = (n) => String(n).padStart(2, "0");
     const nowLocal = `${dtNow.getFullYear()}-${pad2(dtNow.getMonth() + 1)}-${pad2(dtNow.getDate())}T${pad2(dtNow.getHours())}:${pad2(dtNow.getMinutes())}`;
     const timeInput = h("input", { type: "datetime-local", value: nowLocal });
-    const intervalInput = h("input", { type: "number", value: 3, min: 1, max: 72 });
+    const intervalInput = h("input", { type: "number", value: 3, min: 0.25, max: 72, step: 0.25 });
     const timeWrap = h("div", { class: "stack", style: { marginTop: "8px" } },
       h("label", { class: "field" }, h("span", { class: "lbl" }, "First upload time"), timeInput));
     const intervalWrap = h("div", { class: "stack", style: { marginTop: "8px", display: "none" } },
@@ -870,6 +909,8 @@ function PublisherPage() {
 
       const startTime = new Date(timeInput.value).getTime() / 1000;
       if (isNaN(startTime)) { toast("Choose a valid start date and time.", true); return; }
+      const rawHours = parseFloat(intervalInput.value);
+      const intervalMins = Math.max(1, Math.round((isNaN(rawHours) ? 3 : rawHours) * 60));
 
       submitBtn.disabled = true;
       try {
@@ -881,7 +922,7 @@ function PublisherPage() {
             clip_accounts: clipAccountsPayload,
             mode: modeSelect.value,
             start_time: startTime,
-            interval_minutes: Math.max(1, parseInt(intervalInput.value, 10) * 60),
+            interval_minutes: intervalMins,
             options: {}
           }
         });
@@ -1056,7 +1097,11 @@ function ModelsPage() {
     await api("/models/ollama/pull", { method: "POST", json: { name } });
     pullInput.value = ""; await refreshStatus(); poll();
   }
-  const installed = (name) => ollama.models.some((m) => m.name === name || m.name === name + ":latest");
+  const sameModel = (a, b) => {
+    if (!a || !b) return false;
+    return a === b || a.replace(/:latest$/, "") === b.replace(/:latest$/, "");
+  };
+  const installed = (name) => ollama.models.some((m) => sameModel(m.name, name));
 
   function pullRow(name, st, onRetry) {
     const failed = !!st.error;
@@ -1086,9 +1131,9 @@ function ModelsPage() {
       h("h3", { style: { margin: "14px 0 0" } }, "Installed"),
       ...ollama.models.map((m) => {
         const roles = [];
-        if (m.name === settings.filter_model) roles.push(chip("First pass", "ok"));
-        if (m.name === settings.ranker_model) roles.push(chip("Ranking", "ok"));
-        if (m.name === settings.vision_model) roles.push(chip("Vision Director", "ok"));
+        if (sameModel(m.name, settings.filter_model)) roles.push(chip("First pass", "ok"));
+        if (sameModel(m.name, settings.ranker_model)) roles.push(chip("Ranking", "ok"));
+        if (sameModel(m.name, settings.vision_model)) roles.push(chip("Vision Director", "ok"));
         return h("div", { class: "model" },
           h("div", {}, h("strong", {}, m.name), " ", h("span", { class: "small muted" }, [m.params, m.quant, fmtBytes(m.size)].filter(Boolean).join(" · ")), " ", roles),
           h("div", { class: "row" },
